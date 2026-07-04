@@ -1,0 +1,17 @@
+# Secretos
+.env
+.env.*
+!.env.example
+
+# Entorno Python
+venv/
+__pycache__/
+*.pyc
+
+# Logs y datos locales
+*.log
+*.db
+*.sqlite3
+
+# Sistema
+.DS_Store
