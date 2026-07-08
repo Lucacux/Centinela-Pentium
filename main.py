@@ -1,3 +1,4 @@
+# deploy-test 2026-07-08: linea no-op para validar el auto-update por git-pull timer. Seguro de borrar.
 import discord
 from discord.ext import tasks, commands
 import psutil
