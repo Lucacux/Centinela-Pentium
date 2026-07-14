@@ -13,6 +13,7 @@ import io
 from collections import deque
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from grafana import GrafanaClient, GrafanaError, parse_range
 
 # --- CONFIGURACION ---
 load_dotenv()
@@ -28,6 +29,24 @@ SSH_FAIL_THRESHOLD = int(os.getenv('SSH_FAIL_THRESHOLD', '10'))
 SSH_FAIL_WINDOW = int(os.getenv('SSH_FAIL_WINDOW', '120'))
 SWAP_ALERT_PCT = int(os.getenv('SWAP_ALERT_PCT', '50'))
 TEMP_ALERT_C = int(os.getenv('TEMP_ALERT_C', '85'))
+
+# --- GRAFANA (feature opcional: paneles del dashboard en el bot) ---
+# Todo se descubre en caliente via la API; no se hardcodea ningun dashboard/panel.
+GRAFANA_URL = os.getenv('GRAFANA_URL', '').rstrip('/')
+GRAFANA_TOKEN = os.getenv('GRAFANA_TOKEN', '')
+GRAFANA_DEFAULT_RANGE = os.getenv('GRAFANA_DEFAULT_RANGE', '6h')
+GRAFANA_THEME = os.getenv('GRAFANA_THEME', 'dark')
+GRAFANA_TZ = os.getenv('GRAFANA_TZ', 'browser')
+GRAFANA_PANEL_W = int(os.getenv('GRAFANA_PANEL_WIDTH', '1000'))
+GRAFANA_PANEL_H = int(os.getenv('GRAFANA_PANEL_HEIGHT', '500'))
+GRAFANA_DASH_W = int(os.getenv('GRAFANA_DASH_WIDTH', '1200'))
+GRAFANA_DASH_H = int(os.getenv('GRAFANA_DASH_HEIGHT', '1400'))
+GRAFANA_ORANGE = 0xF46800
+
+grafana_client = (
+    GrafanaClient(GRAFANA_URL, GRAFANA_TOKEN)
+    if GRAFANA_URL and GRAFANA_TOKEN else None
+)
 
 if not TOKEN or not CHANNEL_ID_ENV:
     print("ERROR: Falta DISCORD_TOKEN o DISCORD_CHANNEL_ID en .env")
@@ -568,6 +587,14 @@ async def on_ready():
             "`!cve`       Auditoria de seguridad\n"
             "`!backups`   Estado de backups"
         )
+        if grafana_client is not None:
+            cmds += (
+                "\n\n**Grafana**\n"
+                "`!grafana`          Lista dashboards\n"
+                "`!grafana <d>`      Lista paneles\n"
+                "`!grafana <d> <p>`  Render de un panel\n"
+                "`!grafana <d> full` Dashboard completo"
+            )
         embed = discord.Embed(
             title=f"Centinela v7.0 ONLINE — {SERVER_NAME}",
             description=f"Monitoreo activo. Distro: **{DISTRO}**.",
@@ -1064,6 +1091,132 @@ async def manual_cve(ctx):
     else:
         embed = discord.Embed(title="✅ Sistema Seguro", description="Sin vulnerabilidades criticas.", color=0x2ecc71)
     await msg.edit(content=None, embed=embed)
+
+# ==========================================
+# COMANDO GRAFANA (paneles del dashboard en el bot)
+# ==========================================
+def _chunk_fields(embed, lines, name="​"):
+    """Agrega 'lines' al embed respetando el limite de 1024 char por field."""
+    chunk = ""
+    for ln in lines:
+        if len(chunk) + len(ln) + 1 > 1000:
+            embed.add_field(name=name, value=chunk, inline=False)
+            chunk = ""
+        chunk += ln + "\n"
+    if chunk:
+        embed.add_field(name=name, value=chunk, inline=False)
+
+
+@bot.command(name='grafana', aliases=['gf', 'dash'])
+async def grafana_cmd(ctx, dashboard: str = None, panel: str = None, rng: str = None):
+    """Ver los graficos de Grafana en Discord (descubrimiento 100% dinamico).
+
+    Uso:
+      !grafana                    -> lista los dashboards
+      !grafana <dashboard>        -> lista los paneles de ese dashboard
+      !grafana <dashboard> <panel> [rango]  -> renderiza ese panel (imagen exacta)
+      !grafana <dashboard> full [rango]      -> renderiza el dashboard completo
+    <dashboard> = uid o parte del titulo · <panel> = id o parte del titulo
+    [rango] = 15m | 6h | 24h | 7d (default: GRAFANA_DEFAULT_RANGE)
+    """
+    if grafana_client is None:
+        return await ctx.send(
+            "❌ Feature de Grafana no configurada. Definí `GRAFANA_URL` y `GRAFANA_TOKEN` en `.env`."
+        )
+    try:
+        # Nivel 0: listar dashboards
+        if not dashboard:
+            dashboards = await grafana_client.list_dashboards()
+            if not dashboards:
+                return await ctx.send("No hay dashboards en Grafana.")
+            embed = discord.Embed(
+                title="📊 Dashboards de Grafana",
+                description="Usá `!grafana <dashboard>` para ver sus paneles.",
+                color=GRAFANA_ORANGE,
+            )
+            by_folder = {}
+            for d in dashboards:
+                by_folder.setdefault(d['folder'], []).append(d)
+            for folder, items in by_folder.items():
+                val = "\n".join(f"`{d['uid']}` — {d['title']}" for d in items)
+                embed.add_field(name=f"📁 {folder}", value=val, inline=False)
+            embed.set_footer(text="!grafana <dashboard> [panel] [rango]")
+            return await ctx.send(embed=embed)
+
+        # Resolver dashboard por uid o titulo
+        matches = await grafana_client.find_dashboards(dashboard)
+        if not matches:
+            return await ctx.send(f"❌ No encontré un dashboard que matchee `{dashboard}`.")
+        if len(matches) > 1:
+            opts = "\n".join(f"`{d['uid']}` — {d['title']}" for d in matches[:10])
+            return await ctx.send(f"🤔 `{dashboard}` es ambiguo:\n{opts}\nEspecificá el `uid`.")
+        info = await grafana_client.get_dashboard(matches[0]['uid'])
+
+        # Nivel 1: listar paneles del dashboard
+        if not panel:
+            embed = discord.Embed(
+                title=f"📊 {info['title']}",
+                description=(f"`{len(info['panels'])}` paneles · "
+                             f"`!grafana {info['uid']} <id|nombre> [rango]`"),
+                color=GRAFANA_ORANGE,
+            )
+            lines = [f"`{p['id']:>3}` · {p['type'][:11]:<11} · {p['title']}" for p in info['panels'][:40]]
+            _chunk_fields(embed, lines)
+            if len(info['panels']) > 40:
+                embed.set_footer(text=f"...y {len(info['panels']) - 40} más · `full` = dashboard completo")
+            else:
+                embed.set_footer(text="Tip: `!grafana <dash> full` → dashboard completo")
+            return await ctx.send(embed=embed)
+
+        from_expr, to_expr = parse_range(rng, GRAFANA_DEFAULT_RANGE)
+        range_label = rng or GRAFANA_DEFAULT_RANGE
+
+        # Nivel 2b: dashboard completo
+        if panel.lower() in ('full', 'all', '*'):
+            msg = await ctx.send(f"🖼️ Renderizando **{info['title']}** completo...")
+            img = await grafana_client.render_dashboard(
+                info['uid'], info['slug'], from_expr, to_expr,
+                GRAFANA_DASH_W, GRAFANA_DASH_H, GRAFANA_THEME, GRAFANA_TZ,
+            )
+            fname = f"{info['slug']}.png"
+            file = discord.File(io.BytesIO(img), filename=fname)
+            embed = discord.Embed(title=f"📊 {info['title']}", color=GRAFANA_ORANGE, timestamp=datetime.now())
+            embed.set_image(url=f"attachment://{fname}")
+            embed.set_footer(text=f"Grafana · dashboard completo · rango {range_label}")
+            await ctx.send(file=file, embed=embed)
+            return await msg.delete()
+
+        # Nivel 2a: panel individual
+        found = grafana_client.resolve_panel(info['panels'], panel)
+        if not found:
+            return await ctx.send(
+                f"❌ No encontré el panel `{panel}` en **{info['title']}**. "
+                f"Listá con `!grafana {info['uid']}`."
+            )
+        if len(found) > 1:
+            opts = "\n".join(f"`{p['id']}` — {p['title']}" for p in found[:10])
+            return await ctx.send(f"🤔 `{panel}` matchea varios paneles:\n{opts}\nUsá el `id`.")
+        target = found[0]
+        msg = await ctx.send(f"🖼️ Renderizando **{target['title']}**...")
+        img = await grafana_client.render_panel(
+            info['uid'], info['slug'], target['id'], from_expr, to_expr,
+            GRAFANA_PANEL_W, GRAFANA_PANEL_H, GRAFANA_THEME, GRAFANA_TZ,
+        )
+        fname = f"panel_{target['id']}.png"
+        file = discord.File(io.BytesIO(img), filename=fname)
+        embed = discord.Embed(
+            title=f"{info['title']} — {target['title']}",
+            color=GRAFANA_ORANGE, timestamp=datetime.now(),
+        )
+        embed.set_image(url=f"attachment://{fname}")
+        embed.set_footer(text=f"Grafana · panel {target['id']} ({target['type']}) · rango {range_label}")
+        await ctx.send(file=file, embed=embed)
+        await msg.delete()
+    except GrafanaError as e:
+        await ctx.send(f"❌ Grafana: {e}")
+    except Exception as e:
+        await ctx.send(f"❌ Error inesperado: `{e}`")
+
 
 # --- START ---
 async def shutdown():
