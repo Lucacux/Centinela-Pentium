@@ -212,6 +212,47 @@ class GrafanaClient:
         self._check_renderer(body)
         return body
 
+    async def render_panel_by_ref(
+        self, dashboard_ref, panel_ref, from_expr="now-6h", to_expr="now",
+        width=1000, height=500, theme="dark", tz="browser", variables=None,
+    ):
+        """Resuelve dashboard/panel por UID, ID o titulo y devuelve su PNG.
+
+        El resultado es ``(dashboard, panel, imagen)``. Exigir coincidencias
+        univocas evita que una busqueda parcial cambie silenciosamente de panel
+        cuando se agregan dashboards o paneles nuevos.
+        """
+        dashboards = await self.find_dashboards(dashboard_ref)
+        if not dashboards:
+            raise GrafanaError(
+                f"no encontre el dashboard '{dashboard_ref}'."
+            )
+        if len(dashboards) > 1:
+            raise GrafanaError(
+                f"el dashboard '{dashboard_ref}' es ambiguo "
+                f"({len(dashboards)} coincidencias)."
+            )
+
+        dashboard = await self.get_dashboard(dashboards[0]["uid"])
+        panels = self.resolve_panel(dashboard["panels"], panel_ref)
+        if not panels:
+            raise GrafanaError(
+                f"no encontre el panel '{panel_ref}' en "
+                f"'{dashboard['title']}'."
+            )
+        if len(panels) > 1:
+            raise GrafanaError(
+                f"el panel '{panel_ref}' es ambiguo "
+                f"({len(panels)} coincidencias)."
+            )
+
+        panel = panels[0]
+        image = await self.render_panel(
+            dashboard["uid"], dashboard["slug"], panel["id"],
+            from_expr, to_expr, width, height, theme, tz, variables,
+        )
+        return dashboard, panel, image
+
     async def render_dashboard(
         self, uid, slug, from_expr="now-6h", to_expr="now",
         width=1000, height=1200, theme="dark", tz="browser", variables=None,

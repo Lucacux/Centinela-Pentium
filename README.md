@@ -15,6 +15,7 @@ A Discord bot for monitoring and securing Linux servers (multi-distro: Arch / De
 - **Vulnerability Auditing:** integrates `arch-audit` (Arch) or `debsecan` (Debian/Ubuntu) to report packages with known CVEs.
 - **Update Commands:** suggests the correct update command (`pacman -Syu` / `apt upgrade`) based on the detected distro.
 - **Grafana Panels (optional):** view your *actual* Grafana dashboard panels inside Discord. Dashboards and panels are discovered **dynamically** via the Grafana API — add a dashboard or panel in Grafana and it shows up in the bot with **zero code changes**. Panels are rendered server-side by Grafana (requires the [`grafana-image-renderer`](https://grafana.com/grafana/plugins/grafana-image-renderer/) plugin), so the image is pixel-identical to the dashboard.
+- **Fleet snapshot in Guardian Report:** when Grafana is configured, every six-hour Guardian Report includes the `Estado de nodos` panel from `Fleet Overview` in the same Discord message. Dashboard, panel, range, and image dimensions can be changed through the `GRAFANA_GUARDIAN_*` variables.
 
 ### 📊 Grafana command
 
@@ -61,6 +62,8 @@ See [`.env.example`](./.env.example) for the full list:
 | `ALLOWED_RESTART` | Services the bot is allowed to restart |
 | `SSH_FAIL_THRESHOLD` / `SSH_FAIL_WINDOW` | Threshold and window for brute-force detection |
 | `SWAP_ALERT_PCT` / `TEMP_ALERT_C` | Resource alert thresholds |
+| `GRAFANA_URL` / `GRAFANA_TOKEN` | Grafana API URL and Viewer service-account token |
+| `GRAFANA_GUARDIAN_*` | Fleet panel, range, dimensions, and enable/disable switch for Guardian Report |
 
 ## 📄 License
 

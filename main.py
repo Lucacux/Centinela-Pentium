@@ -42,6 +42,20 @@ GRAFANA_PANEL_H = int(os.getenv('GRAFANA_PANEL_HEIGHT', '500'))
 GRAFANA_DASH_W = int(os.getenv('GRAFANA_DASH_WIDTH', '1200'))
 GRAFANA_DASH_H = int(os.getenv('GRAFANA_DASH_HEIGHT', '1400'))
 GRAFANA_ORANGE = 0xF46800
+GRAFANA_GUARDIAN_ENABLED = os.getenv(
+    'GRAFANA_GUARDIAN_ENABLED', 'true'
+).lower() in ('true', '1', 'yes')
+GRAFANA_GUARDIAN_DASHBOARD = os.getenv(
+    'GRAFANA_GUARDIAN_DASHBOARD', 'fleet-overview'
+).strip()
+GRAFANA_GUARDIAN_PANEL = os.getenv(
+    'GRAFANA_GUARDIAN_PANEL', 'Estado de nodos'
+).strip()
+GRAFANA_GUARDIAN_RANGE = os.getenv(
+    'GRAFANA_GUARDIAN_RANGE', '15m'
+).strip()
+GRAFANA_GUARDIAN_W = int(os.getenv('GRAFANA_GUARDIAN_WIDTH', '1200'))
+GRAFANA_GUARDIAN_H = int(os.getenv('GRAFANA_GUARDIAN_HEIGHT', '700'))
 
 grafana_client = (
     GrafanaClient(GRAFANA_URL, GRAFANA_TOKEN)
@@ -548,6 +562,31 @@ async def get_chart_image(include_disk=False, last_n=20):
             print(f"Error Chart API: {e}")
     return None
 
+
+async def get_guardian_fleet_image():
+    """Captura el estado de la flota que acompana al Guardian Report."""
+    if (
+        grafana_client is None
+        or not GRAFANA_GUARDIAN_ENABLED
+        or not GRAFANA_GUARDIAN_DASHBOARD
+        or not GRAFANA_GUARDIAN_PANEL
+    ):
+        return None
+
+    from_expr, to_expr = parse_range(
+        GRAFANA_GUARDIAN_RANGE, GRAFANA_DEFAULT_RANGE
+    )
+    return await grafana_client.render_panel_by_ref(
+        GRAFANA_GUARDIAN_DASHBOARD,
+        GRAFANA_GUARDIAN_PANEL,
+        from_expr,
+        to_expr,
+        GRAFANA_GUARDIAN_W,
+        GRAFANA_GUARDIAN_H,
+        GRAFANA_THEME,
+        GRAFANA_TZ,
+    )
+
 # ==========================================
 # EVENTOS Y TAREAS
 # ==========================================
@@ -820,13 +859,59 @@ async def guardian_report():
         temp_lines = [f"`{k}`: **{v:.0f}°C**" for k, v in sorted(temps.items(), key=lambda x: x[1], reverse=True)[:3]]
         embed.add_field(name="🌡 Temperaturas", value="\n".join(temp_lines), inline=False)
 
-    image_data = await get_chart_image(include_disk=True, last_n=60)
-    if image_data:
-        file = discord.File(io.BytesIO(image_data), filename="report.png")
-        embed.set_image(url="attachment://report.png")
-        await channel.send(file=file, embed=embed)
-    else:
-        await channel.send(embed=embed)
+    image_data, fleet_result = await asyncio.gather(
+        get_chart_image(include_disk=True, last_n=60),
+        get_guardian_fleet_image(),
+        return_exceptions=True,
+    )
+
+    files = []
+    embeds = [embed]
+
+    if isinstance(image_data, Exception):
+        print(
+            f"WARN: no se pudo generar el grafico del Guardian Report: "
+            f"{image_data}",
+            file=sys.stderr,
+        )
+    elif image_data:
+        files.append(discord.File(
+            io.BytesIO(image_data), filename="guardian-report.png"
+        ))
+        embed.set_image(url="attachment://guardian-report.png")
+
+    if isinstance(fleet_result, Exception):
+        print(
+            f"WARN: no se pudo adjuntar Grafana al Guardian Report: "
+            f"{fleet_result}",
+            file=sys.stderr,
+        )
+        embed.add_field(
+            name="🌐 Grafana Fleet",
+            value="⚠️ Captura no disponible en este envío.",
+            inline=False,
+        )
+    elif fleet_result is not None:
+        dashboard, panel, fleet_image = fleet_result
+        files.append(discord.File(
+            io.BytesIO(fleet_image), filename="grafana-fleet.png"
+        ))
+        fleet_embed = discord.Embed(
+            title=f"🌐 Grafana — {dashboard['title']}",
+            description=panel["title"],
+            color=GRAFANA_ORANGE,
+            timestamp=datetime.now(),
+        )
+        fleet_embed.set_image(url="attachment://grafana-fleet.png")
+        fleet_embed.set_footer(
+            text=f"Fleet status · rango {GRAFANA_GUARDIAN_RANGE}"
+        )
+        embeds.append(fleet_embed)
+
+    await channel.send(
+        files=files or discord.utils.MISSING,
+        embeds=embeds,
+    )
 
     for k in stats_counter:
         stats_counter[k] = 0
