@@ -247,7 +247,10 @@ def _country_from_event(event):
 def _add_country_field(embed, country):
     if country is None:
         return
-    source = f"\nFuente: `{country.source}`" if country.source else ""
+    if country.source == "DB-IP Lite local":
+        source = "\nFuente: [DB-IP Lite](https://db-ip.com) local"
+    else:
+        source = f"\nFuente: `{country.source}`" if country.source else ""
     embed.add_field(
         name="🌍 País estimado por IP",
         value=f"`{country.label}`{source}",

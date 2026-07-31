@@ -1,0 +1,8 @@
+[Unit]
+Description=Update Centinela local country MMDB
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/centinela-geoip-update.sh

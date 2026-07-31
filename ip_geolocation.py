@@ -11,8 +11,11 @@ from pathlib import Path
 
 
 DEFAULT_DATABASE_PATHS = (
+    "/var/lib/GeoIP/Country.mmdb",
     "/var/lib/GeoIP/GeoLite2-Country.mmdb",
+    "/usr/share/GeoIP/Country.mmdb",
     "/usr/share/GeoIP/GeoLite2-Country.mmdb",
+    "/usr/local/share/GeoIP/Country.mmdb",
     "/usr/local/share/GeoIP/GeoLite2-Country.mmdb",
 )
 
@@ -164,13 +167,22 @@ class CountryResolver:
             return CountryEstimate(
                 name=str(name).strip(),
                 code=code,
-                source="GeoLite2 local",
+                source=self._database_source(),
             )
         except Exception as error:
             # AddressNotFoundError and an invalid/old database must not stop the
             # security watcher.  Keep the diagnostic for DEBUG_MODE instead.
             self.error = f"Lookup GeoIP falló para {ip}: {error}"
             return None
+
+    def _database_source(self):
+        try:
+            database_type = str(self._reader.metadata().database_type)
+        except (AttributeError, OSError, ValueError):
+            database_type = ""
+        if database_type.upper().startswith("DBIP-"):
+            return "DB-IP Lite local"
+        return "GeoLite2 local"
 
     def close(self):
         if self._reader is not None and hasattr(self._reader, "close"):
