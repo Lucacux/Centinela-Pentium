@@ -1,7 +1,83 @@
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
-from grafana import GrafanaClient, GrafanaError
+from grafana import GrafanaClient, GrafanaError, png_size
+
+
+def png(width=10, height=10):
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\x0dIHDR"
+        + width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00"
+    )
+
+
+class FakeResponse:
+    def __init__(self, status, body=b"", content_type="text/plain"):
+        self.status = status
+        self.body = body
+        self.headers = {"Content-Type": content_type}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    async def read(self):
+        return self.body
+
+
+class FakeSession:
+    def __init__(self, responses):
+        self.responses = responses
+        self.requests = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    def get(self, *_args, **_kwargs):
+        self.requests += 1
+        return self.responses.pop(0)
+
+
+class RenderRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retries_transient_renderer_failure(self):
+        image = png(1600, 1600)
+        session = FakeSession([
+            FakeResponse(500),
+            FakeResponse(200, image, "image/png"),
+        ])
+        sleep = AsyncMock()
+        client = GrafanaClient("http://grafana.invalid", "token")
+
+        with patch("grafana.aiohttp.ClientSession", return_value=session), patch(
+            "grafana.asyncio.sleep", sleep
+        ):
+            result = await client._get_bytes("/render/d/fleet/fleet")
+
+        self.assertEqual(png_size(result), (1600, 1600))
+        self.assertEqual(session.requests, 2)
+        sleep.assert_awaited_once_with(2)
+
+    async def test_does_not_retry_non_transient_http_error(self):
+        session = FakeSession([FakeResponse(401)])
+        sleep = AsyncMock()
+        client = GrafanaClient("http://grafana.invalid", "token")
+
+        with patch("grafana.aiohttp.ClientSession", return_value=session), patch(
+            "grafana.asyncio.sleep", sleep
+        ):
+            with self.assertRaisesRegex(GrafanaError, "HTTP 401"):
+                await client._get_bytes("/render/d/fleet/fleet")
+
+        self.assertEqual(session.requests, 1)
+        sleep.assert_not_awaited()
 
 
 class RenderPanelByRefTests(unittest.IsolatedAsyncioTestCase):
