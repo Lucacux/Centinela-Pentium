@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from security_events import (
     EventCorrelator,
+    access_app_matches,
     classify_ssh_origin,
     cloudflare_event_id,
     is_loopback,
@@ -100,6 +101,29 @@ class ParserTests(unittest.TestCase):
         }
         self.assertEqual(cloudflare_event_id(item), cloudflare_event_id(dict(item)))
 
+    def test_access_app_match_is_host_exact_and_path_aware(self):
+        self.assertTrue(
+            access_app_matches(
+                "ssh.example.com", "https://ssh.example.com/private"
+            )
+        )
+        self.assertTrue(
+            access_app_matches(
+                "https://ssh.example.com/admin",
+                "https://ssh.example.com/admin/terminal",
+            )
+        )
+        self.assertFalse(
+            access_app_matches(
+                "ssh.example.com", "https://ssh.example.com.attacker.test"
+            )
+        )
+        self.assertFalse(
+            access_app_matches(
+                "ssh.example.com/admin", "ssh.example.com/administrator"
+            )
+        )
+
 
 class CorrelationTests(unittest.TestCase):
     def setUp(self):
@@ -134,6 +158,73 @@ class CorrelationTests(unittest.TestCase):
         )
         self.assertIsNone(
             self.events.latest_cloudflare_access(self.now, max_age_seconds=180)
+        )
+
+    def test_selects_nearest_matching_unused_access_event(self):
+        self.events.add(
+            "cloudflare_access",
+            ip="198.51.100.1",
+            timestamp=self.now - timedelta(seconds=20),
+            allowed=True,
+            event_id="other-app",
+            app_domain="other.example.com",
+        )
+        self.events.add(
+            "cloudflare_access",
+            ip="198.51.100.2",
+            timestamp=self.now - timedelta(seconds=10),
+            allowed=True,
+            event_id="already-used",
+            app_domain="ssh.example.com",
+        )
+        self.events.add(
+            "cloudflare_access",
+            ip="198.51.100.3",
+            timestamp=self.now + timedelta(seconds=2),
+            allowed=True,
+            event_id="nearest",
+            app_domain="https://ssh.example.com",
+        )
+        event = self.events.nearest_cloudflare_access(
+            self.now,
+            max_skew_seconds=30,
+            app_domain="ssh.example.com",
+            excluded_ids={"already-used"},
+        )
+        self.assertEqual(event.ip, "198.51.100.3")
+
+    def test_nearest_rejects_denied_wrong_action_and_old_events(self):
+        self.events.add(
+            "cloudflare_access",
+            ip="198.51.100.4",
+            timestamp=self.now,
+            allowed=False,
+            event_id="denied",
+            app_domain="ssh.example.com",
+        )
+        self.events.add(
+            "cloudflare_access",
+            ip="198.51.100.6",
+            timestamp=self.now,
+            allowed=True,
+            action="logout",
+            event_id="wrong-action",
+            app_domain="ssh.example.com",
+        )
+        self.events.add(
+            "cloudflare_access",
+            ip="198.51.100.5",
+            timestamp=self.now - timedelta(minutes=4),
+            allowed=True,
+            event_id="old",
+            app_domain="ssh.example.com",
+        )
+        self.assertIsNone(
+            self.events.nearest_cloudflare_access(
+                self.now,
+                max_skew_seconds=180,
+                app_domain="ssh.example.com",
+            )
         )
 
 

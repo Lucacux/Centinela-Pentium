@@ -28,14 +28,27 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-ci.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m pip install --disable-pip-version-check -r requirements-ci.txt
           python -m pip check
+
+      - name: Lint for fatal Python errors
+        run: ruff check --isolated --select E9,F63,F7,F82 .
 
       - name: Compile Python sources
         run: python -m compileall -q .
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+
+      - name: Reject high-severity static security findings
+        run: bandit -q -r . -x ./tests,./.git -lll
+
+      - name: Audit Python dependencies
+        run: pip-audit -r requirements.txt

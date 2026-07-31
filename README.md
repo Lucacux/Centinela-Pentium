@@ -18,7 +18,7 @@ A Discord bot for monitoring and securing Linux servers (multi-distro: Arch / De
 - **Grafana Panels (optional):** view your *actual* Grafana dashboard panels inside Discord. Dashboards and panels are discovered **dynamically** via the Grafana API — add a dashboard or panel in Grafana and it shows up in the bot with **zero code changes**. Panels are rendered server-side by Grafana (requires the [`grafana-image-renderer`](https://grafana.com/grafana/plugins/grafana-image-renderer/) plugin), so the image is pixel-identical to the dashboard.
 - **Complete Fleet Overview in Guardian Report:** every six hours the bot renders the full Grafana dashboard (summary, node table, CPU, RAM, disk, load, network and temperatures) and splits the tall PNG into readable Discord pages. Dashboard, range, render dimensions and page height are configurable through `GRAFANA_GUARDIAN_*`.
 - **Correlated security events:** SSH failures are grouped by source IP and users attempted; a Fail2ban ban is enriched with those preceding attempts. The watcher uses `fail2ban-client` when permitted and falls back to the read-only Fail2ban journal.
-- **Traceable Cloudflare Access logins (optional):** polls the official Zero Trust Access authentication-log API and reports identity, the public client IP observed by Cloudflare, application and Ray ID. For SSH/TCP, where the origin can only see the `cloudflared` process address, a local SSH login is explicitly marked as a time-based correlation with the latest allowed Access event.
+- **Traceable Cloudflare Access logins (optional):** polls the official Zero Trust Access authentication-log API and reports identity, the public client IP observed by Cloudflare, application and Ray ID. For SSH/TCP, where the origin can only see the `cloudflared` process address, a loopback SSH login triggers an immediate API refresh with short retries. Centinela then claims the closest allowed event for the exact configured application, so one Access event cannot enrich two SSH sessions. If the API is unavailable or there is no match, the alert keeps the observed loopback address rather than guessing.
 - **Private GeoIP enrichment:** Access, SSH brute-force and Fail2ban alerts include the country estimated from the public IP. A country supplied by Cloudflare is preferred; otherwise Centinela reads a local Country MMDB (DB-IP Lite or MaxMind GeoLite2) and caches results. Client IPs are never sent to a third-party geolocation API. Country is context, not proof of physical location: VPNs, proxies and mobile/CGNAT networks may report their exit country.
 - **One bot for Pentium + Arch:** the Discord bot runs only on Pentium and also
   monitors `server-mbp` through a constrained collector. The collector key has
@@ -225,8 +225,8 @@ See [`.env.example`](./.env.example) for the full list:
 | `ALLOWED_RESTART` | Services the bot is allowed to restart |
 | `SSH_FAIL_THRESHOLD` / `SSH_FAIL_WINDOW` | Threshold and window for brute-force detection |
 | `FAIL2BAN_ENABLED` | Notify new bans (client status with journald fallback) |
-| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_ACCESS_TOKEN` | Optional Access authentication logs (`Access: Audit Logs Read`) |
-| `CLOUDFLARE_ACCESS_APP` / `CLOUDFLARE_CORRELATION_SECONDS` | Limit Access events to one app and bound SSH correlation |
+| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_ACCESS_TOKEN` | Optional Access authentication logs; use an account-scoped token with only `Access: Audit Logs Read` |
+| `CLOUDFLARE_ACCESS_APP` / `CLOUDFLARE_CORRELATION_SECONDS` | Exact Access hostname (optionally URL/path) and maximum clock/time skew used for SSH correlation |
 | `GEOIP_COUNTRY_DB` / `GEOIP_COUNTRY_LOCALE` | Local Country MMDB path and preferred country-name language |
 | `SWAP_ALERT_PCT` / `TEMP_ALERT_C` | Resource alert thresholds |
 | `GRAFANA_URL` / `GRAFANA_TOKEN` | Grafana API URL and Viewer service-account token |

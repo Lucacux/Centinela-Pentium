@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import ipaddress
 import re
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -53,6 +54,38 @@ def is_loopback(value):
         return ipaddress.ip_address(value).is_loopback
     except ValueError:
         return value in {"localhost", "::ffff:127.0.0.1"}
+
+
+def _access_app_parts(value):
+    """Return a normalized ``(host[:port], path)`` for an Access app URL."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "", ""
+    parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+    host = parsed.hostname or ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return "", ""
+    authority = f"{host}:{port}" if host and port else host
+    path = "/" + parsed.path.strip("/") if parsed.path.strip("/") else ""
+    return authority.rstrip("."), path
+
+
+def access_app_matches(configured, observed):
+    """Match an Access application exactly by host and, if set, path prefix."""
+    configured_host, configured_path = _access_app_parts(configured)
+    observed_host, observed_path = _access_app_parts(observed)
+    if not configured_host:
+        return True
+    if configured_host != observed_host:
+        return False
+    if not configured_path:
+        return True
+    return (
+        observed_path == configured_path
+        or observed_path.startswith(f"{configured_path}/")
+    )
 
 
 def classify_ssh_origin(observed_ip, effective_ip, safe_subnets, correlated=False):
@@ -192,6 +225,43 @@ class EventCorrelator:
             if event.metadata.get("allowed")
         ]
         return max(allowed, key=lambda event: event.timestamp, default=None)
+
+    def nearest_cloudflare_access(
+        self,
+        at=None,
+        max_skew_seconds=180,
+        app_domain="",
+        excluded_ids=None,
+    ):
+        """Return the closest unused, allowed Access event for one application.
+
+        A symmetric window tolerates small clock differences between Cloudflare
+        and the SSH host.  Callers claim the returned event ID so one browser
+        authentication cannot be attributed to multiple SSH sessions.
+        """
+        at = parse_timestamp(at)
+        excluded_ids = set(excluded_ids or ())
+        maximum_skew = timedelta(seconds=max_skew_seconds)
+        candidates = []
+        for event in self.events:
+            if event.kind != "cloudflare_access":
+                continue
+            if not event.metadata.get("allowed") or not event.ip:
+                continue
+            action = str(event.metadata.get("action") or "").lower()
+            if action and "login" not in action:
+                continue
+            event_id = str(event.metadata.get("event_id") or "")
+            if event_id and event_id in excluded_ids:
+                continue
+            if not access_app_matches(
+                app_domain, event.metadata.get("app_domain", "")
+            ):
+                continue
+            skew = abs(event.timestamp - at)
+            if skew <= maximum_skew:
+                candidates.append((skew, -event.timestamp.timestamp(), event))
+        return min(candidates, key=lambda value: value[:2], default=(None, None, None))[2]
 
 
 class CloudflareAccessClient:
