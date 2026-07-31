@@ -195,6 +195,24 @@ cp .env.example .env  # fill in your real values
 python main.py
 ```
 
+### systemd hardening
+
+Production runs the bot as the dedicated `centinela` system account, not as an
+interactive administrator. The audited drop-in is
+`deploy/discord-bot-hardening.conf`; install it as
+`/etc/systemd/system/discord-bot.service.d/hardening.conf` only after moving
+writable state to `/var/lib/centinela` and any constrained remote-agent key to
+`/etc/centinela`. The account needs `adm` to read SSH/journal events and,
+currently, `docker` for container inspection and explicitly requested
+restarts. It must not belong to `sudo` or `lxd`.
+
+The drop-in makes the OS, home directories, kernel interfaces and namespaces
+read-only or inaccessible, removes every process capability and enables
+`NoNewPrivileges`. Validate with `systemd-analyze verify discord-bot.service`,
+then restart and confirm `systemd-analyze security discord-bot.service` plus
+the Discord gateway log. Docker group membership remains a root-equivalent
+trust boundary; the next hardening stage is replacing it with a narrow helper.
+
 ### Local GeoIP country database
 
 The production setup uses the monthly
