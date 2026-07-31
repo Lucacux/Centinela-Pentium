@@ -55,6 +55,26 @@ def is_loopback(value):
         return value in {"localhost", "::ffff:127.0.0.1"}
 
 
+def classify_ssh_origin(observed_ip, effective_ip, safe_subnets, correlated=False):
+    """Describe an SSH origin without treating a local proxy as an Internet IP."""
+    if is_loopback(observed_ip) and not correlated:
+        return {
+            "is_local": False,
+            "unresolved_proxy": True,
+            "label": "Proxy local · origen público no disponible",
+        }
+    is_local = any(
+        str(effective_ip or "").startswith(prefix)
+        for prefix in safe_subnets
+        if prefix
+    )
+    return {
+        "is_local": is_local,
+        "unresolved_proxy": False,
+        "label": "Red local" if is_local else "⚠️ IP externa",
+    }
+
+
 def parse_ssh_line(line):
     """Return a normalized SSH event dict, or ``None`` for unrelated lines."""
     match = _SSH_LOGIN_RE.search(line)
