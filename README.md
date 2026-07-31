@@ -97,6 +97,10 @@ Critical findings — which trains you to ignore the colour red.
 
 `<dashboard>` matches by uid or by a substring of the title; `<panel>` by id or title substring. Enable it by setting `GRAFANA_URL` and `GRAFANA_TOKEN` (a Grafana service-account token, Viewer role is enough) in `.env`.
 
+The periodic Guardian report waits five minutes after a bot restart before its
+first Fleet Overview render.  This prevents deployments from competing with a
+cold image renderer; tune it with `GRAFANA_GUARDIAN_START_DELAY_SECONDS`.
+
 ### 🌐 Network diagnostics
 
 `!red` (aliases `!net`, `!diag`) replaces the old boolean "internet is down" check

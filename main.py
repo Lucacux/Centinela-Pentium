@@ -102,6 +102,7 @@ GRAFANA_PANEL_W = int(os.getenv('GRAFANA_PANEL_WIDTH', '1000'))
 GRAFANA_PANEL_H = int(os.getenv('GRAFANA_PANEL_HEIGHT', '500'))
 GRAFANA_DASH_W = int(os.getenv('GRAFANA_DASH_WIDTH', '1200'))
 GRAFANA_DASH_H = int(os.getenv('GRAFANA_DASH_HEIGHT', '1400'))
+GRAFANA_HTTP_TIMEOUT = int(os.getenv('GRAFANA_HTTP_TIMEOUT_SECONDS', '70'))
 GRAFANA_ORANGE = 0xF46800
 GRAFANA_GUARDIAN_ENABLED = os.getenv(
     'GRAFANA_GUARDIAN_ENABLED', 'true'
@@ -117,9 +118,12 @@ GRAFANA_GUARDIAN_H = int(os.getenv('GRAFANA_GUARDIAN_HEIGHT', '1600'))
 GRAFANA_GUARDIAN_PAGE_H = int(
     os.getenv('GRAFANA_GUARDIAN_PAGE_HEIGHT', '900')
 )
+GRAFANA_GUARDIAN_START_DELAY = max(0, int(
+    os.getenv('GRAFANA_GUARDIAN_START_DELAY_SECONDS', '300')
+))
 
 grafana_client = (
-    GrafanaClient(GRAFANA_URL, GRAFANA_TOKEN)
+    GrafanaClient(GRAFANA_URL, GRAFANA_TOKEN, timeout=GRAFANA_HTTP_TIMEOUT)
     if GRAFANA_URL and GRAFANA_TOKEN else None
 )
 cloudflare_client = (
@@ -2505,6 +2509,14 @@ async def guardian_report():
 
     for k in stats_counter:
         stats_counter[k] = 0
+
+
+@guardian_report.before_loop
+async def wait_before_first_guardian_report():
+    """Avoid a cold Chromium render immediately after every bot deploy."""
+    await bot.wait_until_ready()
+    if GRAFANA_GUARDIAN_START_DELAY:
+        await asyncio.sleep(GRAFANA_GUARDIAN_START_DELAY)
 
 # ==========================================
 # COMANDOS
