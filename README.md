@@ -16,7 +16,10 @@ A Discord bot for monitoring and securing Linux servers (multi-distro: Arch / De
 - **Correct restarts under Swarm:** `!restart <service>` issues `docker service update --force` for Swarm services and falls back to `docker restart` for plain containers. A plain `docker restart` on a Swarm task is the wrong operation — the orchestrator just recreates the task on its own, outside the scheduler.
 - **Update Commands:** suggests the correct update command (`pacman -Syu` / `apt upgrade`) based on the detected distro.
 - **Grafana Panels (optional):** view your *actual* Grafana dashboard panels inside Discord. Dashboards and panels are discovered **dynamically** via the Grafana API — add a dashboard or panel in Grafana and it shows up in the bot with **zero code changes**. Panels are rendered server-side by Grafana (requires the [`grafana-image-renderer`](https://grafana.com/grafana/plugins/grafana-image-renderer/) plugin), so the image is pixel-identical to the dashboard.
-- **Fleet snapshot in Guardian Report:** when Grafana is configured, every six-hour Guardian Report includes the `Estado de nodos` panel from `Fleet Overview` in the same Discord message. Dashboard, panel, range, and image dimensions can be changed through the `GRAFANA_GUARDIAN_*` variables.
+- **Complete Fleet Overview in Guardian Report:** every six hours the bot renders the full Grafana dashboard (summary, node table, CPU, RAM, disk, load, network and temperatures) and splits the tall PNG into readable Discord pages. Dashboard, range, render dimensions and page height are configurable through `GRAFANA_GUARDIAN_*`.
+- **Correlated security events:** SSH failures are grouped by source IP and users attempted; a Fail2ban ban is enriched with those preceding attempts. The watcher uses `fail2ban-client` when permitted and falls back to the read-only Fail2ban journal.
+- **Traceable Cloudflare Access logins (optional):** polls the official Zero Trust Access authentication-log API and reports identity, the public client IP observed by Cloudflare, application and Ray ID. For SSH/TCP, where the origin can only see the `cloudflared` process address, a local SSH login is explicitly marked as a time-based correlation with the latest allowed Access event.
+- **Private GeoIP enrichment:** Access, SSH brute-force and Fail2ban alerts include the country estimated from the public IP. A country supplied by Cloudflare is preferred; otherwise Centinela reads a local MaxMind GeoLite2 Country database and caches results. Client IPs are never sent to a third-party geolocation API. Country is context, not proof of physical location: VPNs, proxies and mobile/CGNAT networks may report their exit country.
 
 ### 🤝 Split with the Updates-Bot
 
@@ -145,6 +148,20 @@ cp .env.example .env  # fill in your real values
 python main.py
 ```
 
+### Local GeoIP country database
+
+1. Create a MaxMind GeoLite account and generate a download license key.
+2. Install `geoipupdate` on the server and configure `EditionIDs GeoLite2-Country`
+   in its `GeoIP.conf`. Keep the account ID and license key outside this repo.
+3. Run `geoipupdate` and point `GEOIP_COUNTRY_DB` at the generated
+   `GeoLite2-Country.mmdb`. The bot also discovers the usual Linux locations
+   under `/var/lib/GeoIP`, `/usr/share/GeoIP`, and `/usr/local/share/GeoIP`.
+4. Schedule `geoipupdate` with its distro-provided timer or cron job so country
+   estimates do not become stale.
+
+If the database is absent, corrupt, or cannot resolve an address, security
+monitoring continues normally and simply omits the country field.
+
 ## ⚙️ Environment Variables
 
 See [`.env.example`](./.env.example) for the full list:
@@ -158,6 +175,10 @@ See [`.env.example`](./.env.example) for the full list:
 | `WATCHED_SERVICES` / `MANAGED_SERVICES` | systemd services under supervision |
 | `ALLOWED_RESTART` | Services the bot is allowed to restart |
 | `SSH_FAIL_THRESHOLD` / `SSH_FAIL_WINDOW` | Threshold and window for brute-force detection |
+| `FAIL2BAN_ENABLED` | Notify new bans (client status with journald fallback) |
+| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_ACCESS_TOKEN` | Optional Access authentication logs (`Access: Audit Logs Read`) |
+| `CLOUDFLARE_ACCESS_APP` / `CLOUDFLARE_CORRELATION_SECONDS` | Limit Access events to one app and bound SSH correlation |
+| `GEOIP_COUNTRY_DB` / `GEOIP_COUNTRY_LOCALE` | Local `GeoLite2-Country.mmdb` path and preferred country-name language |
 | `SWAP_ALERT_PCT` / `TEMP_ALERT_C` | Resource alert thresholds |
 | `GRAFANA_URL` / `GRAFANA_TOKEN` | Grafana API URL and Viewer service-account token |
 | `GRAFANA_GUARDIAN_*` | Fleet panel, range, dimensions, and enable/disable switch for Guardian Report |
