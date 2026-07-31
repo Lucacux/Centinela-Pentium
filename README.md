@@ -90,6 +90,42 @@ produces false positives. `speedtest-cli --list` shows the available IDs. Each r
 costs ~40 MB and ~25 s, hence the cooldown, and measurements are skipped entirely
 while the network is unhealthy so a broken link cannot poison the baseline.
 
+### 🚨 Alarms
+
+Threshold alerting is a small CloudWatch-style engine (`alerts.py`) instead of
+hand-written `if value > threshold and cooldown` blocks. `!alarmas` shows the
+current state of every alarm.
+
+| What it fixes | Before | Now |
+|---|---|---|
+| Single-sample triggers | One 91% disk sample sent `DISCO CRITICO` | **N of M datapoints** — 2 of 3 by default |
+| No recovery notice | `CPU CRITICA` arrived, `normalizada` never did | Every state transition notifies, with how long it lasted |
+| Unmeasurable = fine | A vanished sensor read as 0 and looked healthy | Explicit `INSUFFICIENT_DATA` state |
+| Cooldown hid transitions | The 1h cooldown swallowed the recovery message | Cooldown applies only to reminders, never to transitions |
+
+**Quiet hours**: at night only `critica` alarms get through. Recoveries are held
+too — waking someone to say something already fixed itself is the worst possible
+alert.
+
+**Actions are proposed, never executed.** Each alarm carries a suggested next
+step that is posted with the alert; the bot does not act on the system by itself.
+Auto-execution exists (`auto=True`) but is off for every alarm and has to be
+turned on deliberately, one alarm at a time.
+
+### 📊 Process sampling
+
+`procmon.py` exists because the high-consumption diagnosis was silently broken.
+`psutil.Process.cpu_percent()` without an interval returns usage *since the
+previous call on that same object* — the first call always returns `0.0`. `!top`
+got away with it by priming and sleeping 1s, but `watch_resources` called it
+cold, so the CPU alert — the one moment the information matters — listed
+`systemd`, `kthreadd` and `kworker` at 0%, ordered by PID.
+
+The fix keeps the `Process` objects alive between samples and refreshes them from
+the one-minute loop, so each reading is a true one-minute average and alerts read
+warm data without sleeping or blocking the event loop. CPU is normalised by core
+count (psutil reports up to `100 * ncores`, i.e. 200% on the E5400).
+
 ## 🧰 Stack
 
 - Python 3.12
@@ -131,6 +167,8 @@ See [`.env.example`](./.env.example) for the full list:
 | `NET_HTTP_PROBE` / `NET_HTTP_EXPECT` | Captive-portal probe URL and its expected status code |
 | `SPEEDTEST_SERVER_ID` | **Pin this.** Auto-selection picks servers 3400 km away and varies per run |
 | `SPEEDTEST_ENABLED` / `SPEEDTEST_EVERY_HOURS` / `SPEEDTEST_COOLDOWN_MIN` | Periodic measurement and rate limiting |
+| `SPEEDTEST_SLOW_RATIO` / `SPEEDTEST_DEGRADED_RATIO` | Thresholds as a fraction of your median. Loose on purpose: this link swings 26% between back-to-back runs |
+| `QUIET_HOURS_ENABLED` / `QUIET_HOURS_START` / `QUIET_HOURS_END` | Night window where only critical alarms notify |
 
 ## 📄 License
 

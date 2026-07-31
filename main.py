@@ -15,6 +15,9 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
 import netdiag
+import procmon
+import alerts
+from alerts import ALARM, CRITICAL, NO_DATA, OK, WARNING, Alarm, AlarmEngine
 from grafana import GrafanaClient, GrafanaError, parse_range
 from docker_ops import (
     docker_cmd,
@@ -129,19 +132,44 @@ history_disk = deque(maxlen=HISTORY_LEN)
 history_swap = deque(maxlen=HISTORY_LEN)
 
 stats_counter = {"ssh_events": 0, "ssh_fails": 0, "docker_alerts": 0, "service_alerts": 0}
+# Solo para lo que NO pasa por el motor de alarmas (que lleva su propio
+# cooldown por alarma): fuerza bruta SSH y el ritmo del speedtest.
 last_alert_time = {
-    "cpu": datetime.min, "ram": datetime.min, "disk": datetime.min,
-    "swap": datetime.min, "temp": datetime.min, "network": datetime.min,
     "bruteforce": datetime.min, "speedtest": datetime.min, "slow": datetime.min,
 }
 ALERT_COOLDOWN = timedelta(hours=1)
+
+# --- ALARMAS (ver alerts.py) ---
+# Umbral, N de M, severidad y cooldown declarados en un solo lugar. Solo lo
+# marcado como critico atraviesa el modo silencio nocturno.
+#
+# `action` describe que hacer, pero NO se ejecuta: se propone y decidis vos.
+# Nada de esto toca el sistema por su cuenta.
+alarm_engine = AlarmEngine([
+    # 2 de 3 minutos: un pico de compilacion no es una emergencia, tres
+    # minutos sostenidos al 90% si.
+    Alarm("cpu", "🔥 CPU alta", 90, datapoints=2, periods=3, severity=CRITICAL,
+          description="CPU sostenida por encima del 90%.",
+          action="Revisá `!top`; si hay un proceso desbocado, `!restart <servicio>`."),
+    Alarm("ram", "🧠 RAM alta", 90, datapoints=2, periods=3, severity=CRITICAL,
+          description="Memoria por encima del 90%.",
+          action="Revisá `!top`. Con 3.8 GB en el pentium, el candidato suele ser un contenedor sin límite."),
+    # El disco no oscila: si esta al 91% dos muestras seguidas, esta lleno.
+    Alarm("disco", "🚨 Disco crítico", 90, datapoints=2, periods=2, severity=CRITICAL,
+          description="Partición raíz por encima del 90%.",
+          action="`docker system prune` y revisá `/var/log`. Ya pasó de llenar `/var` en la VM Debian."),
+    Alarm("swap", "⚠️ Swap en uso", SWAP_ALERT_PCT, datapoints=3, periods=4, severity=WARNING,
+          description="Uso de swap sostenido: el equipo está paginando.",
+          action="Ver qué proceso creció en `!top` por RAM."),
+    Alarm("temp", "🌡️ Temperatura alta", TEMP_ALERT_C, datapoints=2, periods=3, severity=CRITICAL,
+          unit="°C", description="Sensor por encima del umbral.",
+          action="Revisá ventilación y polvo. Si el sensor desaparece, la alarma pasa a SIN DATOS."),
+])
 last_docker_alert = {}
 docker_heal_attempts = {}
 DOCKER_LOOP_COOLDOWN = timedelta(minutes=30)
 HEAL_TIMEOUT = timedelta(hours=1)
 
-cpu_high_streak = 0
-ram_high_streak = 0
 
 ssh_fail_timestamps = deque(maxlen=500)
 last_service_status = {}
@@ -167,6 +195,90 @@ def make_bar(value, length=12):
     else:
         emoji = "🟢"
     return f"{emoji} `{bar}` **{int(pct)}%**"
+
+def _fmt_dur(segundos):
+    if not segundos:
+        return "un momento"
+    m, s = divmod(int(segundos), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m" if h else (f"{m}m {s}s" if m else f"{s}s")
+
+
+def build_alarm_embed(evento, temps=None, swap=None):
+    """Convierte un evento del motor en el embed que se postea.
+
+    Aca vive el "si pasa A, respondemos con B": cada alarma trae su accion
+    sugerida y el contexto que hace falta para decidir. La accion se PROPONE,
+    nunca se ejecuta sola.
+    """
+    alarma = evento["alarm"]
+    valor, estado = evento["value"], evento["to"]
+
+    if estado == OK:
+        embed = discord.Embed(
+            title=f"✅ Normalizado: {alarma.title}",
+            description=f"Volvió a la normalidad tras **{_fmt_dur(evento['duration_s'])}** en alarma.",
+            color=0x2ecc71,
+        )
+        if valor is not None:
+            embed.add_field(name="Valor actual", value=f"{valor:.1f}{alarma.unit}", inline=True)
+        return embed
+
+    if estado == NO_DATA:
+        # No es lo mismo que "todo bien": se dejo de poder medir.
+        return discord.Embed(
+            title=f"❔ Sin datos: {alarma.title}",
+            description=f"{alarma.description}\n\nLa métrica dejó de poder medirse. No es lo mismo que estar en cero.",
+            color=0x95a5a6,
+        )
+
+    reincidencia = evento["kind"] == "reminder"
+    embed = discord.Embed(
+        title=f"{alarma.title}{' (sigue)' if reincidencia else ''}",
+        description=alarma.description,
+        color=0xff0000 if alarma.severity == CRITICAL else 0xe67e22,
+    )
+    if valor is not None:
+        embed.add_field(
+            name="Valor",
+            value=f"**{valor:.1f}{alarma.unit}** (umbral {alarma.threshold}{alarma.unit})\n"
+                  + (make_bar(valor) if alarma.unit == "%" else ""),
+            inline=False,
+        )
+    embed.add_field(
+        name="Criterio",
+        value=f"{alarma.datapoints} de {alarma.periods} muestras en falta · severidad **{alarma.severity}**",
+        inline=False,
+    )
+    if reincidencia and evento["duration_s"]:
+        embed.add_field(name="En alarma desde hace", value=_fmt_dur(evento["duration_s"]), inline=False)
+
+    # Contexto util segun la metrica: para CPU y RAM, quien lo esta causando.
+    # Sale del sampler cacheado, que ya tiene tasas reales medidas en el ultimo
+    # minuto -- antes esto listaba systemd y kthreadd con 0%.
+    if alarma.name in ("cpu", "ram", "swap"):
+        clave = "cpu" if alarma.name == "cpu" else "mem"
+        if procmon.sampler.warm():
+            filas = procmon.format_top(procmon.sampler.top(3, clave), clave)
+            if filas:
+                embed.add_field(name="Top procesos", value=filas, inline=False)
+        else:
+            embed.add_field(
+                name="Top procesos",
+                value="_Todavía sin muestra válida de procesos._",
+                inline=False,
+            )
+    if alarma.name == "temp" and temps:
+        caliente = max(temps, key=temps.get)
+        embed.add_field(name="Sensor más caliente", value=f"`{caliente}` — {temps[caliente]:.0f}°C", inline=False)
+    if alarma.name == "swap" and swap is not None:
+        embed.add_field(name="Swap usado", value=format_bytes(swap.used), inline=True)
+
+    if alarma.action:
+        embed.add_field(name="💡 Sugerencia", value=alarma.action, inline=False)
+    embed.set_footer(text=evento["at"].strftime('%d/%m/%Y %H:%M:%S'))
+    return embed
+
 
 def health_color(score):
     if score >= 80:
@@ -276,19 +388,6 @@ def get_temperatures():
     except (AttributeError, Exception):
         pass
     return temps
-
-def get_top_processes(n=8, sort_by="cpu"):
-    procs = []
-    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
-        try:
-            info = proc.info
-            if info['cpu_percent'] is not None:
-                procs.append(info)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    key = 'cpu_percent' if sort_by == "cpu" else 'memory_percent'
-    procs.sort(key=lambda p: p.get(key, 0), reverse=True)
-    return procs[:n]
 
 def get_open_ports():
     ports = []
@@ -587,11 +686,16 @@ async def on_ready():
 
 @tasks.loop(minutes=1)
 async def collect_history():
-    global cpu_high_streak, ram_high_streak
     cpu = psutil.cpu_percent(interval=0.5)
     ram = psutil.virtual_memory().percent
     disk = psutil.disk_usage('/').percent
     swap = psutil.swap_memory().percent
+
+    # Refresca las tasas por proceso desde el loop que ya corre cada minuto, en
+    # un thread para no frenar el event loop barriendo /proc. Asi las alertas
+    # leen datos calientes sin dormir: la lectura es el promedio del ultimo
+    # minuto, que es justo la ventana de una alerta sostenida.
+    await asyncio.to_thread(procmon.sampler.refresh)
 
     history_time.append(datetime.now())
     history_cpu.append(cpu)
@@ -599,62 +703,33 @@ async def collect_history():
     history_disk.append(disk)
     history_swap.append(swap)
 
-    cpu_high_streak = cpu_high_streak + 1 if cpu > 90 else 0
-    ram_high_streak = ram_high_streak + 1 if ram > 90 else 0
-
 @tasks.loop(minutes=2)
 async def watch_resources():
+    """Evalua las metricas del host contra el motor de alarmas.
+
+    Antes esto eran cinco bloques `if valor > umbral and cooldown` escritos a
+    mano, cada uno con su propia nocion de cuando avisar y ninguno con aviso de
+    recuperacion. Ahora solo se miden las metricas y el motor decide.
+    """
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
-    now = datetime.now()
-    disk = psutil.disk_usage('/').percent
-    swap = psutil.swap_memory()
-
-    if cpu_high_streak >= 3 and (now - last_alert_time["cpu"] > ALERT_COOLDOWN):
-        avg_cpu = sum(list(history_cpu)[-3:]) / 3
-        embed = discord.Embed(title="🔥 CPU CRITICA", description=f"**{cpu_high_streak} min** por encima del 90%.", color=0xe74c3c)
-        embed.add_field(name="Uso promedio", value=make_bar(avg_cpu), inline=False)
-        top = get_top_processes(3, "cpu")
-        if top:
-            embed.add_field(name="Top procesos", value="\n".join(f"`{p['name'][:20]}` — {p['cpu_percent']:.0f}%" for p in top), inline=False)
-        embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
-        await channel.send(embed=embed)
-        last_alert_time["cpu"] = now
-
-    if ram_high_streak >= 2 and (now - last_alert_time["ram"] > ALERT_COOLDOWN):
-        avg_ram = sum(list(history_ram)[-2:]) / 2
-        embed = discord.Embed(title="⚠ RAM ALTA", description=f"**{ram_high_streak} min** por encima del 90%.", color=0xe67e22)
-        embed.add_field(name="Uso promedio", value=make_bar(avg_ram), inline=False)
-        top = get_top_processes(3, "ram")
-        if top:
-            embed.add_field(name="Top procesos", value="\n".join(f"`{p['name'][:20]}` — {p['memory_percent']:.1f}%" for p in top), inline=False)
-        embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
-        await channel.send(embed=embed)
-        last_alert_time["ram"] = now
-
-    if disk > 90 and (now - last_alert_time["disk"] > ALERT_COOLDOWN):
-        embed = discord.Embed(title="🚨 DISCO CRITICO", color=0xff0000)
-        embed.add_field(name="Uso actual", value=make_bar(disk), inline=False)
-        embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
-        await channel.send(embed=embed)
-        last_alert_time["disk"] = now
-
-    if swap.percent > SWAP_ALERT_PCT and (now - last_alert_time["swap"] > ALERT_COOLDOWN):
-        embed = discord.Embed(title="⚠️ SWAP en Uso", description=f"**{swap.percent:.0f}%** ({format_bytes(swap.used)})", color=0xe67e22)
-        embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
-        await channel.send(embed=embed)
-        last_alert_time["swap"] = now
 
     temps = get_temperatures()
-    if temps:
-        max_temp = max(temps.values())
-        if max_temp > TEMP_ALERT_C and (now - last_alert_time["temp"] > ALERT_COOLDOWN):
-            hottest = max(temps, key=temps.get)
-            embed = discord.Embed(title="🌡️ TEMPERATURA CRITICA", description=f"**{hottest}**: **{max_temp:.0f}°C** (umbral: {TEMP_ALERT_C}°C)", color=0xff0000)
-            embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
-            await channel.send(embed=embed)
-            last_alert_time["temp"] = now
+    swap = psutil.swap_memory()
+    metricas = {
+        "cpu": history_cpu[-1] if history_cpu else None,
+        "ram": history_ram[-1] if history_ram else None,
+        "disco": psutil.disk_usage('/').percent,
+        "swap": swap.percent,
+        # None y no 0: un sensor que desaparece no es un equipo frio, y el
+        # motor lo distingue pasando la alarma a INSUFFICIENT_DATA.
+        "temp": max(temps.values()) if temps else None,
+    }
+
+    for evento in alarm_engine.evaluate(metricas):
+        await channel.send(embed=build_alarm_embed(evento, temps=temps, swap=swap))
+        stats_counter["alerts"] = stats_counter.get("alerts", 0) + 1
 
 @tasks.loop(minutes=5)
 async def watch_services():
@@ -966,16 +1041,16 @@ async def server_status(ctx):
 
 @bot.command(name='top')
 async def top_processes(ctx):
-    for proc in psutil.process_iter(['cpu_percent']):
-        pass
-    await asyncio.sleep(1)
+    # Bajo demanda se toma una muestra corta y propia: da la foto de AHORA en
+    # vez del promedio del ultimo minuto que usan las alertas. Va en un thread
+    # porque duerme 1s entre las dos lecturas.
+    await asyncio.to_thread(procmon.sampler.sample_now, 1.0)
 
     embed = discord.Embed(title=f"📊 Top Procesos — {SERVER_NAME}", color=0x3498db, timestamp=datetime.now())
     for label, sort in [("🖥 Por CPU", "cpu"), ("🧠 Por RAM", "ram")]:
-        top = get_top_processes(8, sort)
-        key = 'cpu_percent' if sort == "cpu" else 'memory_percent'
-        lines = [f"`{p['name'][:18]:<18}` {p[key]:>5.1f}% `{'█' * int(p[key] / 10)}`" for p in top]
-        embed.add_field(name=label, value="\n".join(lines) or "Sin datos", inline=False)
+        rows = procmon.format_top(procmon.sampler.top(8, sort), "cpu" if sort == "cpu" else "mem")
+        embed.add_field(name=label, value=rows or "Sin datos", inline=False)
+    embed.set_footer(text=f"CPU normalizado sobre {procmon.CPU_COUNT} nucleos")
     await ctx.send(embed=embed)
 
 @bot.command(name='who')
@@ -1246,6 +1321,31 @@ async def do_speedtest():
     verdict = netdiag.evaluate_speed(result, history)
     save_speed_measure(result)
     return result, verdict
+
+
+@bot.command(name='alarmas', aliases=['alarms'])
+async def show_alarms(ctx):
+    """Estado de todas las alarmas, como la consola de CloudWatch."""
+    icono = {OK: "🟢", ALARM: "🔴", NO_DATA: "⚪"}
+    embed = discord.Embed(title=f"🚨 Alarmas — {SERVER_NAME}", color=0x3498db, timestamp=datetime.now())
+    en_alarma = [a for a in alarm_engine.snapshot() if a["state"] == ALARM]
+    embed.color = 0xff0000 if en_alarma else 0x2ecc71
+
+    filas = []
+    for a in alarm_engine.snapshot():
+        valor = f"{a['value']:.1f}{a['unit']}" if a["value"] is not None else "sin dato"
+        filas.append(f"{icono.get(a['state'], '⚪')} `{a['name']:<6}` {valor:>10} / umbral {a['threshold']}{a['unit']}")
+    embed.add_field(name="Estado", value="\n".join(filas), inline=False)
+
+    if alerts.QUIET_ENABLED:
+        activo = " (activo ahora)" if alerts.in_quiet_hours() else ""
+        embed.add_field(
+            name="🌙 Modo silencio",
+            value=f"{alerts.QUIET_START:02d}:00–{alerts.QUIET_END:02d}:00 · solo alertas críticas{activo}",
+            inline=False,
+        )
+    embed.set_footer(text="Las acciones se proponen; ninguna se ejecuta sola.")
+    await ctx.send(embed=embed)
 
 
 @bot.command(name='red', aliases=['net', 'diag'])
