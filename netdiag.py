@@ -453,28 +453,48 @@ def parse_speedtest(raw):
         return {"error": "speedtest devolvio campos incompletos."}
 
 
+# Umbrales como fraccion de la mediana historica.
+#
+# Medido en esta conexion contra el MISMO servidor (67942), tres corridas
+# espaciadas 40s: 15.2 / 18.6 / 19.2 Mbps -- 26% de dispersion en dos minutos.
+# Y la misma conexion contra el mismo servidor media 24.9 Mbps media hora
+# antes. O sea: el ruido normal de este enlace es enorme, y un umbral apretado
+# convierte esa varianza en alertas falsas.
+#
+# Por eso "degraded" (que solo colorea el embed) esta en 0.6 y no en 0.75, y
+# "slow" (lo unico que dispara alerta) en 0.45: para gatillar hace falta una
+# caida mayor que cualquier oscilacion observada.
+SPEED_SLOW_RATIO = float(os.getenv("SPEEDTEST_SLOW_RATIO", "0.45"))
+SPEED_DEGRADED_RATIO = float(os.getenv("SPEEDTEST_DEGRADED_RATIO", "0.6"))
+SPEED_MIN_SAMPLES = int(os.getenv("SPEEDTEST_MIN_SAMPLES", "5"))
+
+
 def evaluate_speed(result, history):
     """Compara contra la mediana historica en vez de un umbral absoluto.
 
     Un umbral fijo no sirve: el numero depende del servidor, de la hora y del
     tramo internacional. Lo que importa es la desviacion respecto de lo normal
-    en ESTA conexion. Con menos de 5 muestras no se opina: se esta aprendiendo.
+    en ESTA conexion. Con pocas muestras no se opina: se esta aprendiendo.
+
+    Se usa mediana y no promedio a proposito: una corrida fallida a 0.5 Mbps
+    arrastraria el promedio hacia abajo y despues lo lento pareceria normal.
     """
     if result.get("error") or not history:
         return None
     samples = sorted(h for h in history if h > 0)
-    if len(samples) < 5:
-        return {"verdict": "baseline", "msg": f"Juntando linea base ({len(samples)}/5 muestras)."}
+    if len(samples) < SPEED_MIN_SAMPLES:
+        return {"verdict": "baseline",
+                "msg": f"Juntando linea base ({len(samples)}/{SPEED_MIN_SAMPLES} muestras)."}
     mid = len(samples) // 2
     median = samples[mid] if len(samples) % 2 else (samples[mid - 1] + samples[mid]) / 2
     if median <= 0:
         return None
     ratio = result["down_mbps"] / median
     pct = (1 - ratio) * 100
-    if ratio < 0.5:
+    if ratio < SPEED_SLOW_RATIO:
         return {"verdict": "slow", "median": median, "pct": pct,
                 "msg": f"**{pct:.0f}% por debajo** de tu mediana ({median:.1f} Mbps)."}
-    if ratio < 0.75:
+    if ratio < SPEED_DEGRADED_RATIO:
         return {"verdict": "degraded", "median": median, "pct": pct,
                 "msg": f"{pct:.0f}% por debajo de tu mediana ({median:.1f} Mbps)."}
     return {"verdict": "ok", "median": median, "pct": pct,

@@ -165,14 +165,23 @@ class EvaluateSpeedTests(unittest.TestCase):
         v = evaluate_speed(self.RESULT, [24, 25, 26, 24, 25, 27])
         self.assertEqual(v["verdict"], "ok")
 
-    def test_mitad_de_la_mediana_es_lento(self):
+    def test_caida_fuerte_es_lento(self):
         v = evaluate_speed({"down_mbps": 10.0}, [24, 25, 26, 24, 25, 27])
         self.assertEqual(v["verdict"], "slow")
         self.assertGreater(v["pct"], 50)
 
     def test_degradado_es_su_propia_categoria(self):
-        v = evaluate_speed({"down_mbps": 17.0}, [24, 25, 26, 24, 25, 27])
+        v = evaluate_speed({"down_mbps": 14.0}, [24, 25, 26, 24, 25, 27])
         self.assertEqual(v["verdict"], "degraded")
+
+    def test_la_dispersion_normal_del_enlace_no_alerta(self):
+        # Medido contra el mismo servidor: 15.2/18.6/19.2 Mbps en dos minutos.
+        # Ese ruido es normal en esta conexion y NO puede gatillar "internet
+        # lento", que es el unico veredicto que postea una alerta.
+        historia = [15.2, 18.6, 19.2, 24.9, 20.0, 17.5]
+        for medicion in (15.2, 18.6, 19.2):
+            v = evaluate_speed({"down_mbps": medicion}, historia)
+            self.assertNotEqual(v["verdict"], "slow", f"{medicion} Mbps no deberia alertar")
 
     def test_error_de_speedtest_no_se_evalua(self):
         self.assertIsNone(evaluate_speed({"error": "timeout"}, [24, 25, 26, 24, 25]))
