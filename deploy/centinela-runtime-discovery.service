@@ -1,0 +1,14 @@
+[Unit]
+Description=Export container and systemd service endpoints for Prometheus
+After=docker.service prometheus-node-exporter.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/monitoring/exporter/centinela-runtime-discovery.py
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/node-exporter-textfile
