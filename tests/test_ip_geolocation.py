@@ -5,8 +5,9 @@ from ip_geolocation import CountryResolver, country_from_cloudflare
 
 
 class FakeReader:
-    def __init__(self):
+    def __init__(self, database_type=""):
         self.calls = []
+        self.database_type = database_type
 
     def country(self, ip):
         self.calls.append(ip)
@@ -16,6 +17,9 @@ class FakeReader:
             name="Argentina",
         )
         return SimpleNamespace(country=country, registered_country=country)
+
+    def metadata(self):
+        return SimpleNamespace(database_type=self.database_type)
 
 
 class CountryExtractionTests(unittest.TestCase):
@@ -57,6 +61,11 @@ class CountryResolverTests(unittest.TestCase):
         )
         self.assertEqual(result.label, "United States (US)")
         self.assertEqual(reader.calls, [])
+
+    def test_dbip_database_is_attributed(self):
+        resolver = CountryResolver(reader=FakeReader("DBIP-Country-Lite"))
+        result = resolver.resolve("8.8.8.8")
+        self.assertEqual(result.source, "DB-IP Lite local")
 
     def test_invalid_address_is_ignored(self):
         resolver = CountryResolver(reader=FakeReader())

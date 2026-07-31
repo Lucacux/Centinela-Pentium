@@ -19,7 +19,7 @@ A Discord bot for monitoring and securing Linux servers (multi-distro: Arch / De
 - **Complete Fleet Overview in Guardian Report:** every six hours the bot renders the full Grafana dashboard (summary, node table, CPU, RAM, disk, load, network and temperatures) and splits the tall PNG into readable Discord pages. Dashboard, range, render dimensions and page height are configurable through `GRAFANA_GUARDIAN_*`.
 - **Correlated security events:** SSH failures are grouped by source IP and users attempted; a Fail2ban ban is enriched with those preceding attempts. The watcher uses `fail2ban-client` when permitted and falls back to the read-only Fail2ban journal.
 - **Traceable Cloudflare Access logins (optional):** polls the official Zero Trust Access authentication-log API and reports identity, the public client IP observed by Cloudflare, application and Ray ID. For SSH/TCP, where the origin can only see the `cloudflared` process address, a local SSH login is explicitly marked as a time-based correlation with the latest allowed Access event.
-- **Private GeoIP enrichment:** Access, SSH brute-force and Fail2ban alerts include the country estimated from the public IP. A country supplied by Cloudflare is preferred; otherwise Centinela reads a local MaxMind GeoLite2 Country database and caches results. Client IPs are never sent to a third-party geolocation API. Country is context, not proof of physical location: VPNs, proxies and mobile/CGNAT networks may report their exit country.
+- **Private GeoIP enrichment:** Access, SSH brute-force and Fail2ban alerts include the country estimated from the public IP. A country supplied by Cloudflare is preferred; otherwise Centinela reads a local Country MMDB (DB-IP Lite or MaxMind GeoLite2) and caches results. Client IPs are never sent to a third-party geolocation API. Country is context, not proof of physical location: VPNs, proxies and mobile/CGNAT networks may report their exit country.
 
 ### 🤝 Split with the Updates-Bot
 
@@ -150,14 +150,16 @@ python main.py
 
 ### Local GeoIP country database
 
-1. Create a MaxMind GeoLite account and generate a download license key.
-2. Install `geoipupdate` on the server and configure `EditionIDs GeoLite2-Country`
-   in its `GeoIP.conf`. Keep the account ID and license key outside this repo.
-3. Run `geoipupdate` and point `GEOIP_COUNTRY_DB` at the generated
-   `GeoLite2-Country.mmdb`. The bot also discovers the usual Linux locations
-   under `/var/lib/GeoIP`, `/usr/share/GeoIP`, and `/usr/local/share/GeoIP`.
-4. Schedule `geoipupdate` with its distro-provided timer or cron job so country
-   estimates do not become stale.
+The production setup uses the monthly
+[DB-IP Country Lite](https://db-ip.com/db/download/ip-to-country-lite) MMDB,
+licensed under CC BY 4.0. Its source is attributed in every Discord field that
+uses it. `deploy/centinela-geoip-update.sh` downloads and validates the latest
+available monthly database without sending client IPs anywhere.
+
+MaxMind GeoLite2 Country is also supported. Point `GEOIP_COUNTRY_DB` at either
+compatible MMDB; the bot additionally discovers `Country.mmdb` and
+`GeoLite2-Country.mmdb` under the usual `/var/lib/GeoIP`, `/usr/share/GeoIP`,
+and `/usr/local/share/GeoIP` paths.
 
 If the database is absent, corrupt, or cannot resolve an address, security
 monitoring continues normally and simply omits the country field.
@@ -178,7 +180,7 @@ See [`.env.example`](./.env.example) for the full list:
 | `FAIL2BAN_ENABLED` | Notify new bans (client status with journald fallback) |
 | `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_ACCESS_TOKEN` | Optional Access authentication logs (`Access: Audit Logs Read`) |
 | `CLOUDFLARE_ACCESS_APP` / `CLOUDFLARE_CORRELATION_SECONDS` | Limit Access events to one app and bound SSH correlation |
-| `GEOIP_COUNTRY_DB` / `GEOIP_COUNTRY_LOCALE` | Local `GeoLite2-Country.mmdb` path and preferred country-name language |
+| `GEOIP_COUNTRY_DB` / `GEOIP_COUNTRY_LOCALE` | Local Country MMDB path and preferred country-name language |
 | `SWAP_ALERT_PCT` / `TEMP_ALERT_C` | Resource alert thresholds |
 | `GRAFANA_URL` / `GRAFANA_TOKEN` | Grafana API URL and Viewer service-account token |
 | `GRAFANA_GUARDIAN_*` | Fleet panel, range, dimensions, and enable/disable switch for Guardian Report |
