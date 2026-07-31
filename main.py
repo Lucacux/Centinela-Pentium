@@ -13,6 +13,8 @@ import io
 from collections import deque
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import json
+import netdiag
 from grafana import GrafanaClient, GrafanaError, parse_range
 from docker_ops import (
     docker_cmd,
@@ -38,6 +40,17 @@ SSH_FAIL_THRESHOLD = int(os.getenv('SSH_FAIL_THRESHOLD', '10'))
 SSH_FAIL_WINDOW = int(os.getenv('SSH_FAIL_WINDOW', '120'))
 SWAP_ALERT_PCT = int(os.getenv('SWAP_ALERT_PCT', '50'))
 TEMP_ALERT_C = int(os.getenv('TEMP_ALERT_C', '85'))
+
+# --- DIAGNOSTICO DE RED (ver netdiag.py) ---
+# El Centinela aca solo OBSERVA: diagnostica y reporta. Quien reinicia el ONU es
+# el ISP Uplink Guardian; nosotros lo consultamos de solo lectura.
+SPEEDTEST_ENABLED = os.getenv('SPEEDTEST_ENABLED', 'true').lower() in ('true', '1', 'yes')
+SPEEDTEST_EVERY_H = int(os.getenv('SPEEDTEST_EVERY_HOURS', '6'))
+# Cada corrida consume ~40 MB y tarda ~25s: sin cooldown propio un usuario
+# impaciente puede saturar el enlace que justamente esta tratando de medir.
+SPEEDTEST_COOLDOWN = timedelta(minutes=int(os.getenv('SPEEDTEST_COOLDOWN_MIN', '10')))
+SPEEDTEST_HISTORY = os.getenv('SPEEDTEST_HISTORY_FILE', 'speedtest_history.json')
+SPEEDTEST_HISTORY_MAX = 60
 
 # --- GRAFANA (feature opcional: paneles del dashboard en el bot) ---
 # Todo se descubre en caliente via la API; no se hardcodea ningun dashboard/panel.
@@ -119,7 +132,7 @@ stats_counter = {"ssh_events": 0, "ssh_fails": 0, "docker_alerts": 0, "service_a
 last_alert_time = {
     "cpu": datetime.min, "ram": datetime.min, "disk": datetime.min,
     "swap": datetime.min, "temp": datetime.min, "network": datetime.min,
-    "bruteforce": datetime.min,
+    "bruteforce": datetime.min, "speedtest": datetime.min, "slow": datetime.min,
 }
 ALERT_COOLDOWN = timedelta(hours=1)
 last_docker_alert = {}
@@ -132,7 +145,13 @@ ram_high_streak = 0
 
 ssh_fail_timestamps = deque(maxlen=500)
 last_service_status = {}
-network_was_down = False
+# Capa culpable del ultimo corte ("wan", "dns", ...) o None si la red esta sana.
+# Guardar la CAPA y no un bool permite avisar cuando la falla se MUEVE de lugar
+# (p.ej. vuelve la WAN pero ahora lo roto es el DNS): con un bool eso pasaba
+# desapercibido porque "seguia caido".
+network_down_layer = None
+network_down_since = None
+speedtest_running = False
 
 # ==========================================
 # HELPERS VISUALES
@@ -316,13 +335,6 @@ def get_smart_health():
             raw = subprocess.getoutput(f"smartctl -H -A {disk} 2>/dev/null")
             return {"disk": disk, "output": raw}
     return None
-
-def check_network():
-    try:
-        result = subprocess.run(["ping", "-c", "1", "-W", "3", "1.1.1.1"], capture_output=True, timeout=5)
-        return result.returncode == 0
-    except Exception:
-        return False
 
 def get_service_status(service_name):
     return subprocess.getoutput(f"systemctl is-active {service_name} 2>/dev/null").strip()
@@ -520,7 +532,7 @@ async def get_guardian_fleet_image():
 @bot.event
 async def on_ready():
     print(f"Bot Centinela ONLINE: {bot.user}")
-    for task in [collect_history, watch_resources, watch_docker_loops, watch_docker_resources, guardian_report, watch_network]:
+    for task in [collect_history, watch_resources, watch_docker_loops, watch_docker_resources, guardian_report, watch_network, watch_speed]:
         if not task.is_running():
             task.start()
     if BACKUP_PATH and not watch_backups.is_running():
@@ -664,20 +676,71 @@ async def watch_services():
             await channel.send(embed=embed)
         last_service_status[svc] = status
 
+def _probe_lines(probes):
+    """Las capas como se muestran en Discord, en orden de escalera."""
+    icon = {netdiag.OK: "🟢", netdiag.FAIL: "🔴", netdiag.SKIP: "⚪"}
+    order = {name: i for i, name in enumerate(netdiag.LAYER_ORDER)}
+    rows = sorted(probes, key=lambda p: order.get(p.layer, 99))
+    return "\n".join(
+        f"{icon.get(p.state, '⚪')} `{p.layer:<7}` {p.detail}"
+        + (f" _({p.ms:.0f}ms)_" if p.ms else "")
+        for p in rows
+    )
+
+
 @tasks.loop(minutes=3)
 async def watch_network():
-    global network_was_down
+    """Vigila la red y reporta QUE capa fallo, no solo que 'se fue internet'.
+
+    El loop viejo tenia un agujero: al detectar el corte solo seteaba un flag y
+    no mandaba nada, asi que el unico aviso llegaba cuando la red YA habia
+    vuelto. Ahora avisa en el momento, con la capa culpable.
+    """
+    global network_down_layer, network_down_since
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
-    is_up = await asyncio.to_thread(check_network)
-    if not is_up and not network_was_down:
-        network_was_down = True
-    elif is_up and network_was_down:
-        network_was_down = False
-        embed = discord.Embed(title="🌐 Red Restaurada", description="Conectividad recuperada.", color=0x2ecc71)
-        embed.set_footer(text=datetime.now().strftime('%H:%M:%S'))
+
+    probes, guardian = await asyncio.to_thread(netdiag.run_all_probes)
+    verdict = netdiag.diagnose(probes)
+    now = datetime.now()
+
+    if not verdict["healthy"]:
+        layer = verdict["layer"]
+        # Se avisa al caer y tambien si la falla se MUEVE a otra capa: es un
+        # cambio de diagnostico, no repeticion del mismo aviso.
+        if layer != network_down_layer:
+            network_down_layer = layer
+            network_down_since = network_down_since or now
+            embed = discord.Embed(
+                title=verdict["title"], description=verdict["summary"], color=0xe74c3c,
+            )
+            embed.add_field(name="Capa", value=verdict["detail"], inline=False)
+            embed.add_field(name="Diagnostico por capas", value=_probe_lines(probes), inline=False)
+            if guardian and guardian.get("outage_secs"):
+                embed.add_field(
+                    name="ISP Guardian",
+                    value=f"Corte de **{int(guardian['outage_secs'])}s** en curso · "
+                          f"{guardian.get('reboots_in_window', 0)}/{guardian.get('max_reboots', '?')} reboots en ventana",
+                    inline=False,
+                )
+            embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
+            await channel.send(embed=embed)
+        return
+
+    if network_down_layer:
+        # Recuperacion: se informa cuanto duro y que capa habia fallado.
+        dur = int((now - network_down_since).total_seconds()) if network_down_since else 0
+        embed = discord.Embed(
+            title="🌐 Red Restaurada",
+            description=f"Se recupero la capa **{network_down_layer}** tras **{dur // 60}m {dur % 60}s**.",
+            color=0x2ecc71,
+        )
+        embed.add_field(name="Estado actual", value=_probe_lines(probes), inline=False)
+        embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
         await channel.send(embed=embed)
+        network_down_layer = None
+        network_down_since = None
 
 @tasks.loop(minutes=2)
 async def watch_docker_loops():
@@ -1118,6 +1181,158 @@ async def check_backups(ctx):
 # ==========================================
 # COMANDO GRAFANA (paneles del dashboard en el bot)
 # ==========================================
+def load_speed_history():
+    """Historial de mediciones. En disco porque la referencia sirve justamente
+    despues de un reinicio del bot: una mediana que se pierde en cada deploy no
+    es una linea base."""
+    try:
+        with open(SPEEDTEST_HISTORY) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_speed_measure(result):
+    hist = load_speed_history()
+    hist.append({
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "down": round(result["down_mbps"], 2),
+        "up": round(result["up_mbps"], 2),
+        "ping": round(result["ping_ms"], 1),
+    })
+    hist = hist[-SPEEDTEST_HISTORY_MAX:]
+    try:
+        with open(SPEEDTEST_HISTORY, "w") as fh:
+            json.dump(hist, fh)
+    except OSError:
+        pass
+    return hist
+
+
+def speed_embed(result, verdict):
+    if result.get("error"):
+        return discord.Embed(title="📉 Speedtest fallo", description=result["error"], color=0xe74c3c)
+    color = 0x2ecc71
+    if verdict and verdict["verdict"] == "slow":
+        color = 0xe74c3c
+    elif verdict and verdict["verdict"] == "degraded":
+        color = 0xe67e22
+    embed = discord.Embed(title=f"📡 Speedtest — {SERVER_NAME}", color=color, timestamp=datetime.now())
+    embed.add_field(name="⬇ Bajada", value=f"**{result['down_mbps']:.1f}** Mbps", inline=True)
+    embed.add_field(name="⬆ Subida", value=f"**{result['up_mbps']:.1f}** Mbps", inline=True)
+    embed.add_field(name="⏱ Ping", value=f"**{result['ping_ms']:.0f}** ms", inline=True)
+    if verdict:
+        embed.add_field(name="Contra tu linea base", value=verdict["msg"], inline=False)
+    # El servidor se muestra siempre: sin saber contra que se midio, el numero
+    # no significa nada (los mas cercanos que ofrece estan a 3400 km).
+    embed.set_footer(text=f"vs {result['server']} · {result['distance_km']:.0f} km · {result['isp']}")
+    return embed
+
+
+async def do_speedtest():
+    """Corre el speedtest fuera del event loop y actualiza la linea base."""
+    global speedtest_running
+    if speedtest_running:
+        return None, None
+    speedtest_running = True
+    try:
+        result = await asyncio.to_thread(netdiag.run_speedtest)
+    finally:
+        speedtest_running = False
+    if result.get("error"):
+        return result, None
+    history = [h["down"] for h in load_speed_history()]
+    verdict = netdiag.evaluate_speed(result, history)
+    save_speed_measure(result)
+    return result, verdict
+
+
+@bot.command(name='red', aliases=['net', 'diag'])
+async def network_diag(ctx):
+    """Diagnostico de red por capas: enlace, WAN, DNS, HTTP y ONU."""
+    msg = await ctx.send("🔎 Diagnosticando la red por capas...")
+    probes, guardian = await asyncio.to_thread(netdiag.run_all_probes)
+    verdict = netdiag.diagnose(probes)
+
+    embed = discord.Embed(
+        title=verdict["title"],
+        description=verdict["summary"],
+        color=0x2ecc71 if verdict["healthy"] else 0xe74c3c,
+        timestamp=datetime.now(),
+    )
+    embed.add_field(name="Capas", value=_probe_lines(probes), inline=False)
+
+    if guardian:
+        estado = "🟢 OK" if guardian.get("wan_up") else "🔴 caido"
+        linea = [f"WAN {estado} · ONU {'🟢' if guardian.get('onu_up') else '🔴'}"]
+        if guardian.get("outage_secs"):
+            linea.append(f"corte en curso: {int(guardian['outage_secs'])}s")
+        linea.append(f"reboots en ventana: {guardian.get('reboots_in_window', 0)}/{guardian.get('max_reboots', '?')}")
+        embed.add_field(name="ISP Guardian (solo lectura)", value=" · ".join(linea), inline=False)
+
+        # "En verbo pasado": cuando volvio, a que hora se cayo y cuanto duro.
+        cortes = [e for e in (guardian.get("events") or []) if e.get("type") == "wan_up"][-5:]
+        if cortes:
+            embed.add_field(
+                name="Ultimos cortes",
+                value="\n".join(f"`{e.get('iso', '?')}` {e.get('msg', '')}" for e in reversed(cortes)),
+                inline=False,
+            )
+    await msg.delete()
+    await ctx.send(embed=embed)
+
+
+@bot.command(name='speedtest', aliases=['velocidad'])
+async def speedtest_cmd(ctx):
+    """Mide la velocidad real del enlace contra la linea base historica."""
+    if not netdiag.speedtest_available():
+        await ctx.send("⚠️ `speedtest-cli` no esta instalado en este host.")
+        return
+    now = datetime.now()
+    restante = SPEEDTEST_COOLDOWN - (now - last_alert_time["speedtest"])
+    if restante > timedelta(0):
+        await ctx.send(f"⏳ Esperá {int(restante.total_seconds() // 60)}m: cada corrida usa ~40 MB del enlace que estamos midiendo.")
+        return
+    if speedtest_running:
+        await ctx.send("⏳ Ya hay un speedtest en curso.")
+        return
+    last_alert_time["speedtest"] = now
+
+    msg = await ctx.send("📡 Midiendo (~25s)...")
+    result, verdict = await do_speedtest()
+    await msg.delete()
+    await ctx.send(embed=speed_embed(result, verdict))
+
+
+@tasks.loop(hours=SPEEDTEST_EVERY_H)
+async def watch_speed():
+    """Mide periodicamente para construir la linea base.
+
+    Solo avisa cuando el enlace esta MUY por debajo de lo normal: el objetivo es
+    tener referencia historica, no postear un embed cada seis horas.
+    """
+    if not SPEEDTEST_ENABLED or not netdiag.speedtest_available():
+        return
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        return
+    # Medir con la red caida da un numero sin sentido y encima ensucia la mediana.
+    probes, _ = await asyncio.to_thread(netdiag.run_all_probes)
+    if not netdiag.diagnose(probes)["healthy"]:
+        return
+
+    result, verdict = await do_speedtest()
+    if not result or result.get("error") or not verdict:
+        return
+    now = datetime.now()
+    if verdict["verdict"] == "slow" and (now - last_alert_time["slow"] > ALERT_COOLDOWN):
+        last_alert_time["slow"] = now
+        embed = speed_embed(result, verdict)
+        embed.title = "🐌 Internet lento"
+        await channel.send(embed=embed)
+
+
 def _chunk_fields(embed, lines, name="​"):
     """Agrega 'lines' al embed respetando el limite de 1024 char por field."""
     chunk = ""

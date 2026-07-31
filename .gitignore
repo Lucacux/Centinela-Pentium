@@ -15,3 +15,6 @@ __pycache__/
 
 # Sistema
 .DS_Store
+
+# Linea base del speedtest (datos locales del host)
+speedtest_history.json
