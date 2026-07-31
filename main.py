@@ -14,6 +14,15 @@ from collections import deque
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from grafana import GrafanaClient, GrafanaError, parse_range
+from docker_ops import (
+    docker_cmd,
+    get_docker_stats,
+    group_services,
+    list_tasks,
+    resolve_service,
+    restart_service,
+    service_of,
+)
 
 # --- CONFIGURACION ---
 load_dotenv()
@@ -226,71 +235,11 @@ async def fetch_updates():
         return parse_updates_debian(raw)
     return []
 
-def get_running_packages():
-    exe_paths = set()
-    try:
-        for proc in psutil.process_iter(['exe']):
-            try:
-                exe = proc.info['exe']
-                if exe and exe.startswith("/usr") and os.path.exists(exe):
-                    exe_paths.add(exe)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    running_packages = set()
-    for exe in exe_paths:
-        if DISTRO == "arch":
-            result = subprocess.getoutput(f"pacman -Qo {exe} 2>/dev/null")
-            if "is owned by" in result:
-                try:
-                    pkg = result.split("is owned by")[1].strip().split()[0]
-                    running_packages.add(pkg)
-                except IndexError:
-                    continue
-        elif DISTRO == "debian":
-            result = subprocess.getoutput(f"dpkg -S {exe} 2>/dev/null")
-            if ":" in result and "no path found" not in result:
-                running_packages.add(result.split(":")[0].strip())
-    return running_packages
-
-def get_system_cves():
-    if DISTRO == "arch":
-        if not shutil.which("arch-audit"):
-            return None
-        return subprocess.getoutput("arch-audit")
-    elif DISTRO == "debian":
-        if not shutil.which("debsecan"):
-            return None
-        suite = subprocess.getoutput("lsb_release -sc 2>/dev/null").strip()
-        if not suite:
-            return None
-        return subprocess.getoutput(f"debsecan --suite {suite} --format detail")
-    return None
-
-def parse_cve_output(output):
-    vulns = []
-    if DISTRO == "arch":
-        for line in output.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if "Critical" in line or "High" in line:
-                vulns.append(f"🔴 {line}")
-    elif DISTRO == "debian":
-        running = get_running_packages()
-        curr = {}
-        for line in output.splitlines():
-            if line.startswith("CVE-"):
-                curr = {"id": line.split()[0], "urgency": "low"}
-                if "urgency:" in line:
-                    curr["urgency"] = line.split("urgency:")[1].split(")")[0].strip()
-            elif curr and line.startswith("  "):
-                pkg = line.strip()
-                if pkg in running and curr.get("urgency") in ["high", "critical"]:
-                    vulns.append(f"🔴 **{pkg}**: `{curr['id']}`")
-    return vulns
+# NOTA: el escaneo de CVEs (arch-audit / debsecan) vivia aca y se fue junto con
+# el comando !cve. Lo cubre el Updates-Bot con `!cve host <nodo>`, que ademas
+# distingue "hay fix publicado" de "un update lo cierra" — distincion que esta
+# version cruda no hacia, y que es la diferencia entre un alerta accionable y
+# 38 Critical permanentes que nadie puede arreglar.
 
 # ==========================================
 # HELPERS DE SISTEMA
@@ -377,28 +326,6 @@ def check_network():
 
 def get_service_status(service_name):
     return subprocess.getoutput(f"systemctl is-active {service_name} 2>/dev/null").strip()
-
-def get_docker_stats():
-    if not shutil.which("docker"):
-        return []
-    raw = subprocess.getoutput(
-        "docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}' 2>/dev/null"
-    )
-    containers = []
-    for line in raw.splitlines():
-        parts = line.split('|')
-        if len(parts) < 4:
-            continue
-        try:
-            containers.append({
-                "name": parts[0].strip(),
-                "cpu": float(parts[1].strip().rstrip('%')),
-                "mem_usage": parts[2].strip(),
-                "mem_pct": float(parts[3].strip().rstrip('%'))
-            })
-        except ValueError:
-            continue
-    return containers
 
 # ==========================================
 # HELPER BACKUP BORG
@@ -617,14 +544,15 @@ async def on_ready():
             "`!smart`     Salud del disco\n"
             "`!who`       Sesiones activas\n\n"
             "**Servicios**\n"
-            "`!docker`    Contenedores Docker\n"
+            "`!ct`        Contenedores (estado en vivo)\n"
             "`!services`  Servicios systemd\n"
-            "`!logs <c>`  Logs de un contenedor\n"
-            "`!restart <c>` Reiniciar contenedor\n\n"
+            "`!logs <s>`  Logs de un servicio\n"
+            "`!restart <s>` Reiniciar un servicio\n\n"
             "**Mantenimiento**\n"
             "`!updates`   Actualizaciones\n"
-            "`!cve`       Auditoria de seguridad\n"
-            "`!backups`   Estado de backups"
+            "`!backups`   Estado de backups\n\n"
+            "_Imagenes Docker y CVEs los maneja el Updates-Bot:_\n"
+            "_`!docker status` · `!cve host` — de toda la flota._"
         )
         if grafana_client is not None:
             cmds += (
@@ -756,27 +684,38 @@ async def watch_docker_loops():
     channel = bot.get_channel(CHANNEL_ID)
     if not channel or not shutil.which("docker"):
         return
-    out = subprocess.getoutput("docker ps --filter status=restarting --format '{{.Names}}'")
-    if not out:
+    ok, out = await asyncio.to_thread(
+        docker_cmd, ["ps", "--filter", "status=restarting", "--format", "{{.Names}}"]
+    )
+    if not ok or not out:
         return
     now = datetime.now()
-    for cont in out.splitlines():
-        if cont in docker_heal_attempts and (now - docker_heal_attempts[cont] > HEAL_TIMEOUT):
-            del docker_heal_attempts[cont]
-        if cont not in docker_heal_attempts:
-            subprocess.getoutput(f"docker restart {cont}")
-            docker_heal_attempts[cont] = now
-            embed = discord.Embed(title="🩹 Auto-Healing", description=f"`{cont}` reiniciado.", color=0x3498db)
+    # Se cuenta por SERVICIO, no por task: bajo Swarm cada reintento del loop es
+    # una task con id nuevo, asi que la memoria de intentos por nombre de
+    # contenedor nunca acertaba y el bot reiniciaba para siempre.
+    for task in group_services([
+        {"name": n, "service": service_of(n), "status": "Restarting",
+         "image": "", "ports": "", "running": False}
+        for n in out.splitlines() if n.strip()
+    ]):
+        svc = task["service"]
+        cur = task["current"]
+        if svc in docker_heal_attempts and (now - docker_heal_attempts[svc] > HEAL_TIMEOUT):
+            del docker_heal_attempts[svc]
+        if svc not in docker_heal_attempts:
+            await asyncio.to_thread(restart_service, svc, cur)
+            docker_heal_attempts[svc] = now
+            embed = discord.Embed(title="🩹 Auto-Healing", description=f"`{svc}` reiniciado.", color=0x3498db)
             embed.set_footer(text=now.strftime('%H:%M:%S'))
             await channel.send(embed=embed)
             stats_counter["docker_alerts"] += 1
             return
-        if now - last_docker_alert.get(cont, datetime.min) > DOCKER_LOOP_COOLDOWN:
-            log = subprocess.getoutput(f"docker logs --tail 5 {cont} 2>&1")
-            embed = discord.Embed(title="🔄 Docker Loop - Fix Fallido", description=f"`{cont}` sigue reiniciando.", color=0xe67e22)
+        if now - last_docker_alert.get(svc, datetime.min) > DOCKER_LOOP_COOLDOWN:
+            _, log = await asyncio.to_thread(docker_cmd, ["logs", "--tail", "5", cur["name"]], 30)
+            embed = discord.Embed(title="🔄 Docker Loop - Fix Fallido", description=f"`{svc}` sigue reiniciando.", color=0xe67e22)
             embed.add_field(name="Log", value=f"```\n{log[:500]}\n```", inline=False)
             await channel.send(embed=embed)
-            last_docker_alert[cont] = now
+            last_docker_alert[svc] = now
             stats_counter["docker_alerts"] += 1
 
 @tasks.loop(minutes=5)
@@ -787,7 +726,7 @@ async def watch_docker_resources():
     containers = await asyncio.to_thread(get_docker_stats)
     for c in containers:
         if c["cpu"] > 90 or c["mem_pct"] > 90:
-            embed = discord.Embed(title=f"🐳 Alto Consumo: {c['name']}", color=0xe67e22)
+            embed = discord.Embed(title=f"🐳 Alto Consumo: {c['service']}", color=0xe67e22)
             if c["cpu"] > 90:
                 embed.add_field(name="CPU", value=f"**{c['cpu']:.1f}%**", inline=True)
             if c["mem_pct"] > 90:
@@ -1057,62 +996,81 @@ async def show_services(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name='logs')
-async def docker_logs(ctx, container: str = None):
-    if not container:
-        return await ctx.send("Uso: `!logs <contenedor>`")
-    if not shutil.which("docker"):
-        return await ctx.send("❌ Docker no instalado.")
-    raw = await asyncio.to_thread(subprocess.getoutput, f"docker logs --tail 25 {container} 2>&1")
-    embed = discord.Embed(title=f"📋 Logs: {container}", color=0x2496ed, timestamp=datetime.now())
-    embed.description = f"```\n{raw[-1800:]}\n```"
+async def docker_logs(ctx, service: str = None):
+    if not service:
+        return await ctx.send("Uso: `!logs <servicio>` — la lista sale de `!ct`.")
+    svc, task = await asyncio.to_thread(resolve_service, service)
+    if not svc:
+        return await ctx.send(f"❌ No encontre un servicio que matchee `{service}`. Mira `!ct`.")
+    ok, raw = await asyncio.to_thread(docker_cmd, ["logs", "--tail", "25", task["name"]], 60)
+    embed = discord.Embed(title=f"📋 Logs: {svc['service']}", color=0x2496ed, timestamp=datetime.now())
+    embed.description = f"```\n{raw[-1800:] or 'Sin salida.'}\n```"
     embed.set_footer(text="Ultimas 25 lineas")
     await ctx.send(embed=embed)
 
 @bot.command(name='restart')
-async def docker_restart(ctx, container: str = None):
-    if not container:
-        return await ctx.send("Uso: `!restart <contenedor>`")
-    if not shutil.which("docker"):
-        return await ctx.send("❌ Docker no instalado.")
-    if ALLOWED_RESTART and container not in ALLOWED_RESTART:
+async def docker_restart(ctx, service: str = None):
+    if not service:
+        return await ctx.send("Uso: `!restart <servicio>` — la lista sale de `!ct`.")
+    svc, task = await asyncio.to_thread(resolve_service, service)
+    if not svc:
+        return await ctx.send(f"❌ No encontre un servicio que matchee `{service}`. Mira `!ct`.")
+    name = svc["service"]
+    if ALLOWED_RESTART and name not in ALLOWED_RESTART:
         allowed = ", ".join(f"`{c}`" for c in ALLOWED_RESTART)
-        return await ctx.send(f"❌ `{container}` no permitido.\nPermitidos: {allowed}")
+        return await ctx.send(f"❌ `{name}` no permitido.\nPermitidos: {allowed}")
 
-    msg = await ctx.send(f"🔄 Reiniciando `{container}`...")
-    result = await asyncio.to_thread(subprocess.getoutput, f"docker restart {container} 2>&1")
-    if container in result:
-        embed = discord.Embed(title=f"✅ Reiniciado: {container}", description=f"Por **{ctx.author.display_name}**.", color=0x2ecc71)
+    msg = await ctx.send(f"🔄 Reiniciando `{name}`...")
+    ok, result = await asyncio.to_thread(restart_service, name, task)
+    if ok:
+        embed = discord.Embed(
+            title=f"✅ Reiniciado: {name}",
+            description=f"Por **{ctx.author.display_name}**.",
+            color=0x2ecc71
+        )
     else:
-        embed = discord.Embed(title=f"❌ Error: {container}", description=f"```\n{result[:500]}\n```", color=0xff0000)
+        embed = discord.Embed(title=f"❌ Error: {name}", description=f"```\n{result[:500]}\n```", color=0xff0000)
     await msg.edit(content=None, embed=embed)
 
-@bot.command(name='docker')
-async def check_docker(ctx):
+@bot.command(name='ct', aliases=['contenedores'])
+async def check_containers(ctx):
+    """Estado en vivo de los contenedores.
+
+    Se llama !ct y no !docker a proposito: !docker es del Updates-Bot, que maneja
+    las actualizaciones de imagen de toda la flota. Este muestra runtime (Up,
+    CPU, RAM, puertos), que aquel no cubre.
+    """
     if not shutil.which("docker"):
         return await ctx.send("🐳 Docker no instalado.")
-    raw = subprocess.getoutput("docker ps -a --format '{{.Names}}|{{.Status}}|{{.Image}}|{{.Ports}}'")
-    if not raw.strip():
+    tasks_now = await asyncio.to_thread(list_tasks)
+    if not tasks_now:
         return await ctx.send("🐳 Sin contenedores.")
 
+    services = group_services(tasks_now)
     stats = await asyncio.to_thread(get_docker_stats)
     stats_map = {s["name"]: s for s in stats}
 
-    embed = discord.Embed(title="🐳 Contenedores Docker", color=0x2496ed, timestamp=datetime.now())
-    for line in raw.splitlines()[:15]:
-        parts = line.split('|')
-        if len(parts) < 3:
-            continue
-        name, status, image = parts[0], parts[1], parts[2]
-        ports = parts[3] if len(parts) > 3 else ""
+    down = sum(1 for s in services if not s["current"]["running"])
+    embed = discord.Embed(
+        title=f"🐳 Contenedores — {SERVER_NAME}",
+        color=0xe74c3c if down else 0x2ecc71,
+        timestamp=datetime.now()
+    )
+    for s in services[:15]:
+        cur = s["current"]
         icons = {"Up": "🟢", "Restarting": "🔄", "Exited": "🔴"}
-        icon = next((v for k, v in icons.items() if k in status), "🟡")
-        value = f"`{status}`\n`{image}`"
-        if ports:
-            value += f"\n`{ports[:50]}`"
-        s = stats_map.get(name)
-        if s:
-            value += f"\nCPU: `{s['cpu']:.1f}%` RAM: `{s['mem_pct']:.1f}%`"
-        embed.add_field(name=f"{icon} {name}", value=value, inline=True)
+        icon = next((v for k, v in icons.items() if k in cur["status"]), "🟡")
+        value = f"`{cur['status']}`\n`{cur['image']}`"
+        if cur["ports"]:
+            value += f"\n`{cur['ports'][:50]}`"
+        st = stats_map.get(cur["name"])
+        if st:
+            value += f"\nCPU: `{st['cpu']:.1f}%` RAM: `{st['mem_pct']:.1f}%`"
+        if s["stale"]:
+            value += f"\n_{s['stale']} task(s) vieja(s) sin limpiar_"
+        embed.add_field(name=f"{icon} {s['service']}", value=value, inline=True)
+    if len(services) > 15:
+        embed.set_footer(text=f"...y {len(services) - 15} servicio(s) mas")
     await ctx.send(embed=embed)
 
 @bot.command(name='updates')
@@ -1156,26 +1114,6 @@ async def check_backups(ctx):
     embed.add_field(name="Tamaño repo", value=format_bytes(repo_size), inline=True)
     embed.add_field(name="Estado", value="✅ Al día" if is_ok else "🔴 Desactualizado", inline=False)
     await ctx.send(embed=embed)
-
-@bot.command(name='cve')
-async def manual_cve(ctx):
-    if DISTRO == "arch":
-        tool, install_cmd = "arch-audit", "sudo pacman -S arch-audit"
-    elif DISTRO == "debian":
-        tool, install_cmd = "debsecan", "sudo apt install debsecan"
-    else:
-        return await ctx.send("❌ Distro no soportada.")
-    msg = await ctx.send(f"🔍 **Auditando con {tool}...**")
-    output = await asyncio.to_thread(get_system_cves)
-    if not output:
-        return await msg.edit(content=f"❌ `{tool}` no instalado. Ejecuta: `{install_cmd}`")
-    vulns = await asyncio.to_thread(parse_cve_output, output)
-    if vulns:
-        embed = discord.Embed(title="🚨 Vulnerabilidades", description="\n".join(vulns[:15]), color=0xff0000)
-        embed.set_footer(text=f"{len(vulns)} encontrada(s)")
-    else:
-        embed = discord.Embed(title="✅ Sistema Seguro", description="Sin vulnerabilidades criticas.", color=0x2ecc71)
-    await msg.edit(content=None, embed=embed)
 
 # ==========================================
 # COMANDO GRAFANA (paneles del dashboard en el bot)

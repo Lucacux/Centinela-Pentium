@@ -12,10 +12,28 @@ A Discord bot for monitoring and securing Linux servers (multi-distro: Arch / De
 - **Resource Alerts:** configurable thresholds for swap usage and system temperature.
 - **Security Score:** aggregates SSH events, service failures, and other metrics into a single health score.
 - **Charts:** generates visual charts of system status via [QuickChart](https://quickchart.io/).
-- **Vulnerability Auditing:** integrates `arch-audit` (Arch) or `debsecan` (Debian/Ubuntu) to report packages with known CVEs.
+- **Swarm-aware container view (`!ct`):** groups containers by *service*, not by task. Under Docker Swarm a container is named `<service>.<slot>.<taskid>` and the task id is regenerated on every redeploy, so raw names are unreadable, impossible to type, and each redeploy leaves the previous task behind as `Exited` — a healthy service looks like one green container next to one red one. `!ct` collapses that into a single entry per service and notes how many stale tasks were left over.
+- **Correct restarts under Swarm:** `!restart <service>` issues `docker service update --force` for Swarm services and falls back to `docker restart` for plain containers. A plain `docker restart` on a Swarm task is the wrong operation — the orchestrator just recreates the task on its own, outside the scheduler.
 - **Update Commands:** suggests the correct update command (`pacman -Syu` / `apt upgrade`) based on the detected distro.
 - **Grafana Panels (optional):** view your *actual* Grafana dashboard panels inside Discord. Dashboards and panels are discovered **dynamically** via the Grafana API — add a dashboard or panel in Grafana and it shows up in the bot with **zero code changes**. Panels are rendered server-side by Grafana (requires the [`grafana-image-renderer`](https://grafana.com/grafana/plugins/grafana-image-renderer/) plugin), so the image is pixel-identical to the dashboard.
 - **Fleet snapshot in Guardian Report:** when Grafana is configured, every six-hour Guardian Report includes the `Estado de nodos` panel from `Fleet Overview` in the same Discord message. Dashboard, panel, range, and image dimensions can be changed through the `GRAFANA_GUARDIAN_*` variables.
+
+### 🤝 Split with the Updates-Bot
+
+Both bots post to the same Discord channel, so the command namespace is shared and
+overlapping names mean two bots answering the same message. The split:
+
+| Scope | Owner |
+|---|---|
+| Live container state, logs, restarts, systemd services, host metrics | **Centinela** (`!ct`, `!logs`, `!restart`, `!services`, `!status`) |
+| Docker **image** updates across the fleet | **Updates-Bot** (`!docker status`, `!docker fix`) |
+| CVEs across the fleet | **Updates-Bot** (`!cve status`, `!cve host <node>`) |
+
+`!docker` and `!cve` used to exist here too and were removed, not renamed away for
+cosmetics: the Updates-Bot separates *"a fix was published"* from *"an update
+actually closes it"*. The raw `debsecan`/`arch-audit` output this bot used to print
+does not make that distinction, so it reported dozens of permanently-unfixable
+Critical findings — which trains you to ignore the colour red.
 
 ### 📊 Grafana command
 
