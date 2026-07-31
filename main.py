@@ -21,6 +21,7 @@ from alerts import ALARM, CRITICAL, NO_DATA, OK, WARNING, Alarm, AlarmEngine
 from grafana import GrafanaClient, GrafanaError, parse_range
 from fleet_report import render_fleet_pages
 from ip_geolocation import CountryEstimate, CountryResolver
+from remote_hosts import RemoteHostClient, RemoteHostConfig, RemoteHostError
 from security_events import (
     CloudflareAccessClient,
     EventCorrelator,
@@ -68,6 +69,14 @@ CLOUDFLARE_CORRELATION_SECONDS = int(
 )
 GEOIP_COUNTRY_DB = os.getenv('GEOIP_COUNTRY_DB', '').strip()
 GEOIP_COUNTRY_LOCALE = os.getenv('GEOIP_COUNTRY_LOCALE', 'es').strip()
+REMOTE_ARCH_TEMP_ALERT_C = int(os.getenv('REMOTE_ARCH_TEMP_ALERT_C', '85'))
+REMOTE_ARCH_SWAP_ALERT_PCT = int(os.getenv('REMOTE_ARCH_SWAP_ALERT_PCT', '50'))
+REMOTE_ARCH_SSH_FAIL_THRESHOLD = int(
+    os.getenv('REMOTE_ARCH_SSH_FAIL_THRESHOLD', str(SSH_FAIL_THRESHOLD))
+)
+REMOTE_ARCH_SSH_FAIL_WINDOW = int(
+    os.getenv('REMOTE_ARCH_SSH_FAIL_WINDOW', str(SSH_FAIL_WINDOW))
+)
 
 # --- DIAGNOSTICO DE RED (ver netdiag.py) ---
 # El Centinela aca solo OBSERVA: diagnostica y reporta. Quien reinicia el ONU es
@@ -118,6 +127,10 @@ cloudflare_client = (
 country_resolver = CountryResolver(
     database_path=GEOIP_COUNTRY_DB,
     locale=GEOIP_COUNTRY_LOCALE,
+)
+remote_arch_config = RemoteHostConfig.from_env()
+remote_arch = (
+    RemoteHostClient(remote_arch_config) if remote_arch_config else None
 )
 
 if not TOKEN or not CHANNEL_ID_ENV:
@@ -228,6 +241,77 @@ cloudflare_since = utcnow() - timedelta(minutes=2)
 network_down_layer = None
 network_down_since = None
 speedtest_running = False
+
+# --- NODO ARCH REMOTO ---
+# El agente remoto no es otro bot de Discord: es un colector de operaciones
+# fijas, invocado mediante una clave SSH con forced-command y sin shell.
+remote_history_time = deque(maxlen=HISTORY_LEN)
+remote_history_cpu = deque(maxlen=HISTORY_LEN)
+remote_history_ram = deque(maxlen=HISTORY_LEN)
+remote_history_disk = deque(maxlen=HISTORY_LEN)
+remote_history_swap = deque(maxlen=HISTORY_LEN)
+remote_last_snapshot = None
+remote_consecutive_failures = 0
+remote_down_since = None
+remote_last_service_status = {}
+remote_network_down_since = None
+remote_security_events = EventCorrelator(window_seconds=900)
+remote_security_since = utcnow() - timedelta(minutes=2)
+remote_security_seen = set()
+remote_security_seen_order = deque(maxlen=4000)
+remote_last_alert_time = {}
+remote_last_docker_alert = {}
+remote_docker_heal_attempts = {}
+remote_backup_alerted = False
+remote_stats_counter = {
+    "ssh_events": 0,
+    "ssh_fails": 0,
+    "docker_alerts": 0,
+    "service_alerts": 0,
+    "fail2ban_bans": 0,
+    "agent_failures": 0,
+}
+
+
+def _remote_alarm_engine():
+    host = remote_arch_config.name if remote_arch_config else "Arch"
+    return AlarmEngine([
+        Alarm(
+            "cpu", f"🔥 CPU alta — {host}", 90,
+            datapoints=2, periods=3, severity=CRITICAL,
+            description="CPU remota sostenida por encima del 90%.",
+            action="Revisá `!top arch`.",
+        ),
+        Alarm(
+            "ram", f"🧠 RAM alta — {host}", 90,
+            datapoints=2, periods=3, severity=CRITICAL,
+            description="Memoria remota por encima del 90%.",
+            action="Revisá `!top arch`.",
+        ),
+        Alarm(
+            "disco", f"🚨 Disco crítico — {host}", 90,
+            datapoints=2, periods=2, severity=CRITICAL,
+            description="Partición raíz remota por encima del 90%.",
+            action="Revisá el consumo de disco en el nodo Arch.",
+        ),
+        Alarm(
+            "swap", f"⚠️ Swap en uso — {host}",
+            REMOTE_ARCH_SWAP_ALERT_PCT,
+            datapoints=3, periods=4, severity=WARNING,
+            description="Uso de swap remoto sostenido.",
+            action="Revisá `!top arch` por RAM.",
+        ),
+        Alarm(
+            "temp", f"🌡️ Temperatura alta — {host}",
+            REMOTE_ARCH_TEMP_ALERT_C,
+            datapoints=2, periods=3, severity=CRITICAL, unit="°C",
+            description="Sensor remoto por encima del umbral.",
+            action="Revisá ventilación y sensores con `!temps arch`.",
+        ),
+    ])
+
+
+remote_alarm_engine = _remote_alarm_engine()
 
 # ==========================================
 # HELPERS VISUALES
@@ -772,6 +856,509 @@ async def get_guardian_fleet_image():
         GRAFANA_TZ,
     )
 
+
+def _is_remote_alias(value):
+    if not value or remote_arch_config is None:
+        return False
+    return value.strip().lower() in {
+        remote_arch_config.key,
+        remote_arch_config.name.lower(),
+        "arch",
+        "mbp",
+        "server-mbp",
+    }
+
+
+def _remote_name():
+    return remote_arch_config.name if remote_arch_config else "Arch"
+
+
+def _format_uptime(seconds):
+    seconds = max(0, int(seconds or 0))
+    days, seconds = divmod(seconds, 86_400)
+    hours, seconds = divmod(seconds, 3_600)
+    minutes, _ = divmod(seconds, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _remote_embed(title, *, color=0x3498db, description=None):
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color,
+        timestamp=datetime.now(),
+    )
+    embed.set_footer(text=f"Nodo remoto: {_remote_name()} · agente SSH restringido")
+    return embed
+
+
+async def _remote_request(ctx, action, *args, status=None):
+    if remote_arch is None:
+        await ctx.send(
+            "❌ El nodo Arch remoto no está configurado en este Centinela."
+        )
+        return None
+    progress = await ctx.send(status) if status else None
+    try:
+        payload = await remote_arch.request(action, *args)
+    except RemoteHostError as error:
+        message = (
+            f"❌ **{_remote_name()}** no respondió a `{action}`: "
+            f"`{str(error)[:300]}`"
+        )
+        if progress:
+            await progress.edit(content=message)
+        else:
+            await ctx.send(message)
+        return None
+    if progress:
+        await progress.delete()
+    return payload
+
+
+def _remote_alarm_embed(event, snapshot):
+    alarm = event["alarm"]
+    value = event["value"]
+    state = event["to"]
+    if state == OK:
+        embed = _remote_embed(
+            f"✅ Normalizado: {alarm.title}",
+            description=(
+                "Volvió a la normalidad tras "
+                f"**{_fmt_dur(event['duration_s'])}** en alarma."
+            ),
+            color=0x2ecc71,
+        )
+    elif state == NO_DATA:
+        embed = _remote_embed(
+            f"❔ Sin datos: {alarm.title}",
+            description=(
+                f"{alarm.description}\n\nLa métrica dejó de poder medirse; "
+                "no se interpreta como cero."
+            ),
+            color=0x95a5a6,
+        )
+    else:
+        continuing = event["kind"] == "reminder"
+        embed = _remote_embed(
+            f"{alarm.title}{' (sigue)' if continuing else ''}",
+            description=alarm.description,
+            color=0xff0000 if alarm.severity == CRITICAL else 0xe67e22,
+        )
+        if value is not None:
+            detail = (
+                f"**{value:.1f}{alarm.unit}** "
+                f"(umbral {alarm.threshold}{alarm.unit})"
+            )
+            if alarm.unit == "%":
+                detail += f"\n{make_bar(value)}"
+            embed.add_field(name="Valor", value=detail, inline=False)
+        embed.add_field(
+            name="Criterio",
+            value=(
+                f"{alarm.datapoints} de {alarm.periods} muestras en falta · "
+                f"severidad **{alarm.severity}**"
+            ),
+            inline=False,
+        )
+        if alarm.name == "temp" and snapshot.get("temperatures"):
+            temps = snapshot["temperatures"]
+            hottest = max(temps, key=temps.get)
+            embed.add_field(
+                name="Sensor más caliente",
+                value=f"`{hottest}` — {temps[hottest]:.1f}°C",
+                inline=False,
+            )
+        if alarm.name == "swap":
+            embed.add_field(
+                name="Swap usado",
+                value=format_bytes(snapshot.get("swap_used", 0)),
+                inline=True,
+            )
+        if alarm.action:
+            embed.add_field(
+                name="💡 Sugerencia", value=alarm.action, inline=False
+            )
+    if value is not None and state in (OK, NO_DATA):
+        embed.add_field(
+            name="Valor actual",
+            value=f"{value:.1f}{alarm.unit}",
+            inline=True,
+        )
+    return embed
+
+
+async def _remote_status_command(ctx):
+    snapshot = await _remote_request(
+        ctx, "snapshot", status=f"📊 Consultando **{_remote_name()}**..."
+    )
+    if not snapshot:
+        return
+    score = 100
+    cpu = float(snapshot.get("cpu_percent", 0))
+    ram = float(snapshot.get("ram_percent", 0))
+    disk = float(snapshot.get("disk_percent", 0))
+    if cpu > 50:
+        score -= cpu - 50
+    if ram > 80:
+        score -= ram - 80
+    if not snapshot.get("network_up", True):
+        score -= 25
+    score = max(0, int(score))
+    embed = _remote_embed(
+        f"🎛 Panel de Control — {_remote_name()}",
+        color=health_color(score),
+    )
+    embed.add_field(
+        name="🏆 Health",
+        value=f"{health_emoji(score)} **{score}/100**",
+        inline=True,
+    )
+    embed.add_field(
+        name="⏱ Uptime",
+        value=f"`{_format_uptime(snapshot.get('uptime_seconds'))}`",
+        inline=True,
+    )
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    embed.add_field(name="🖥 CPU", value=make_bar(cpu), inline=False)
+    embed.add_field(
+        name="🧠 RAM",
+        value=(
+            f"{make_bar(ram)}\n"
+            f"`{format_bytes(snapshot.get('ram_used', 0))} / "
+            f"{format_bytes(snapshot.get('ram_total', 0))}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="💾 Disco",
+        value=(
+            f"{make_bar(disk)}\n"
+            f"`{format_bytes(snapshot.get('disk_used', 0))} / "
+            f"{format_bytes(snapshot.get('disk_total', 0))}`"
+        ),
+        inline=False,
+    )
+    if snapshot.get("swap_total", 0):
+        embed.add_field(
+            name="🔄 Swap",
+            value=make_bar(snapshot.get("swap_percent", 0)),
+            inline=False,
+        )
+    embed.add_field(
+        name="🌐 Red",
+        value=(
+            f"{'🟢' if snapshot.get('network_up') else '🔴'} Internet · "
+            f"↑ `{format_bytes(snapshot.get('net_sent', 0))}` "
+            f"↓ `{format_bytes(snapshot.get('net_recv', 0))}`"
+        ),
+        inline=False,
+    )
+    temps = snapshot.get("temperatures") or {}
+    if temps:
+        hottest = max(temps, key=temps.get)
+        value = temps[hottest]
+        icon = "🔴" if value > REMOTE_ARCH_TEMP_ALERT_C else (
+            "🟡" if value > 70 else "🟢"
+        )
+        embed.add_field(
+            name="🌡 Temp",
+            value=f"{icon} `{hottest}`: **{value:.1f}°C**",
+            inline=False,
+        )
+    await ctx.send(embed=embed)
+
+
+async def _remote_top_command(ctx):
+    payload = await _remote_request(ctx, "top", 8)
+    if not payload:
+        return
+    embed = _remote_embed(f"📊 Top Procesos — {_remote_name()}")
+    for key, title in (("cpu", "🖥 Por CPU"), ("ram", "🧠 Por RAM")):
+        rows = payload.get(key) or []
+        lines = [
+            f"`{row['pid']:>6}` `{row[key]:>5.1f}%` {row['name'][:32]}"
+            for row in rows
+        ]
+        embed.add_field(
+            name=title, value="\n".join(lines) or "Sin datos", inline=False
+        )
+    await ctx.send(embed=embed)
+
+
+async def _remote_sessions_command(ctx):
+    payload = await _remote_request(ctx, "sessions")
+    if not payload:
+        return
+    sessions_now = payload.get("sessions") or []
+    embed = _remote_embed(f"👥 Sesiones Activas — {_remote_name()}")
+    if not sessions_now:
+        embed.description = "No hay sesiones activas."
+    for session in sessions_now[:12]:
+        host = session.get("host") or "local"
+        is_local = host == "local" or any(
+            host.startswith(subnet) for subnet in SAFE_SUBNETS
+        )
+        embed.add_field(
+            name=f"{'🟢' if is_local else '🟡'} {session.get('user', '?')}",
+            value=(
+                f"IP: `{host}`\nTTY: `{session.get('terminal', '?')}`\n"
+                f"Desde: `{session.get('started', '?')}`"
+            ),
+            inline=True,
+        )
+    await ctx.send(embed=embed)
+
+
+async def _remote_temps_command(ctx):
+    snapshot = await _remote_request(ctx, "snapshot")
+    if not snapshot:
+        return
+    temps = snapshot.get("temperatures") or {}
+    embed = _remote_embed(f"🌡 Temperaturas — {_remote_name()}")
+    if not temps:
+        embed.description = (
+            "No se pudieron leer sensores. El nodo sigue figurando, pero la "
+            "temperatura queda explícitamente sin datos."
+        )
+        embed.color = 0xe67e22
+    for label, temp in sorted(
+        temps.items(), key=lambda item: item[1], reverse=True
+    ):
+        icon = "🔴" if temp > REMOTE_ARCH_TEMP_ALERT_C else (
+            "🟡" if temp > 70 else "🟢"
+        )
+        length = min(12, int(temp / 100 * 12))
+        embed.add_field(
+            name=f"{icon} {label}",
+            value=f"`{'█' * length}{'░' * (12 - length)}` **{temp:.1f}°C**",
+            inline=False,
+        )
+    await ctx.send(embed=embed)
+
+
+async def _remote_ports_command(ctx):
+    payload = await _remote_request(ctx, "ports")
+    if not payload:
+        return
+    ports = payload.get("ports") or []
+    embed = _remote_embed(f"🔌 Puertos Abiertos — {_remote_name()}")
+    if not ports:
+        embed.description = "No se detectaron puertos en escucha."
+    else:
+        embed.description = "\n".join(
+            f"{'🌐' if row['ip'] in ('0.0.0.0', '::') else '🏠'} "
+            f"`{row['ip']}:{row['port']}` → `{row['process']}`"
+            for row in ports[:30]
+        )
+    await ctx.send(embed=embed)
+
+
+async def _remote_smart_command(ctx):
+    payload = await _remote_request(
+        ctx, "smart", status=f"🔍 Leyendo SMART en **{_remote_name()}**..."
+    )
+    if not payload:
+        return
+    if not payload.get("available"):
+        return await ctx.send(
+            f"❌ `smartctl` no está instalado en **{_remote_name()}**."
+        )
+    output = payload.get("output") or ""
+    healthy = payload.get("healthy", False)
+    embed = _remote_embed(
+        f"💿 Disco — {payload.get('device') or _remote_name()}",
+        color=0x2ecc71 if healthy else 0xe67e22,
+    )
+    embed.add_field(
+        name="Estado",
+        value="✅ PASSED" if healthy else "⚠️ Sin confirmación de salud",
+        inline=True,
+    )
+    keywords = (
+        "Percentage Used", "Available Spare", "Temperature",
+        "Power On Hours", "Data Units", "Reallocated_Sector",
+        "Wear_Leveling", "Media_Wearout",
+    )
+    lines = [
+        f"`{line.strip()[:80]}`"
+        for line in output.splitlines()
+        if any(key in line for key in keywords)
+    ]
+    if lines:
+        embed.add_field(name="Atributos", value="\n".join(lines[:10]), inline=False)
+    await ctx.send(embed=embed)
+
+
+async def _remote_services_command(ctx):
+    snapshot = await _remote_request(ctx, "snapshot")
+    if not snapshot:
+        return
+    services_now = snapshot.get("services") or {}
+    embed = _remote_embed(f"⚙️ Servicios — {_remote_name()}")
+    if not services_now:
+        embed.description = "No hay servicios configurados para vigilar."
+    for name, status in services_now.items():
+        icon = {"active": "🟢", "inactive": "🔴", "failed": "💀"}.get(
+            status, "🟡"
+        )
+        embed.add_field(
+            name=f"{icon} {name}", value=f"`{status}`", inline=True
+        )
+    embed.color = (
+        0x2ecc71
+        if services_now and all(v == "active" for v in services_now.values())
+        else 0xe74c3c
+    )
+    await ctx.send(embed=embed)
+
+
+async def _remote_containers_command(ctx):
+    payload = await _remote_request(ctx, "docker")
+    if not payload:
+        return
+    if not payload.get("available"):
+        return await ctx.send(f"🐳 Docker no está instalado en **{_remote_name()}**.")
+    containers = payload.get("containers") or []
+    if not containers:
+        return await ctx.send(f"🐳 **{_remote_name()}** no tiene contenedores.")
+    down = sum(
+        1 for item in containers if item.get("state", "").lower() != "running"
+    )
+    embed = _remote_embed(
+        f"🐳 Contenedores — {_remote_name()}",
+        color=0xe74c3c if down else 0x2ecc71,
+    )
+    for item in containers[:18]:
+        state = item.get("state", "").lower()
+        icon = {"running": "🟢", "restarting": "🔄", "exited": "🔴"}.get(
+            state, "🟡"
+        )
+        value = (
+            f"`{item.get('status') or state or '?'}`\n"
+            f"`{item.get('image') or '?'}`"
+        )
+        if item.get("ports"):
+            value += f"\n`{item['ports'][:70]}`"
+        value += (
+            f"\nCPU: `{item.get('cpu', 0):.1f}%` "
+            f"RAM: `{item.get('ram', 0):.1f}%`"
+        )
+        embed.add_field(
+            name=f"{icon} {item.get('name') or '?'}",
+            value=value,
+            inline=True,
+        )
+    await ctx.send(embed=embed)
+
+
+async def _remote_logs_command(ctx, service):
+    payload = await _remote_request(ctx, "logs", service, 25)
+    if not payload:
+        return
+    embed = _remote_embed(f"📋 Logs: {service}")
+    embed.description = f"```\n{(payload.get('output') or 'Sin salida.')[-1800:]}\n```"
+    await ctx.send(embed=embed)
+
+
+async def _remote_restart_command(ctx, service):
+    payload = await _remote_request(
+        ctx, "restart", service,
+        status=f"🔄 Reiniciando `{service}` en **{_remote_name()}**...",
+    )
+    if not payload:
+        return
+    await ctx.send(embed=_remote_embed(
+        f"✅ Reiniciado: {service}",
+        description=f"Por **{ctx.author.display_name}**.",
+        color=0x2ecc71,
+    ))
+
+
+async def _remote_updates_command(ctx):
+    payload = await _remote_request(
+        ctx, "updates",
+        status=f"🔄 Consultando actualizaciones en **{_remote_name()}**...",
+    )
+    if not payload:
+        return
+    updates = payload.get("updates") or []
+    if not updates:
+        embed = _remote_embed(
+            f"✅ Sistema Actualizado — {_remote_name()}", color=0x2ecc71
+        )
+    else:
+        embed = _remote_embed(
+            f"📦 {len(updates)} Actualizaciones — {_remote_name()}",
+            color=0xe67e22,
+        )
+        lines = [
+            f"- **{item['package']}**\n  `{item['old']}` → `{item['new']}`"
+            for item in updates[:12]
+        ]
+        if len(updates) > 12:
+            lines.append(f"\n_...y {len(updates) - 12} más._")
+        embed.description = "\n".join(lines)
+        embed.set_footer(
+            text=f"Nodo remoto: {_remote_name()} · aplicar con sudo pacman -Syu"
+        )
+    await ctx.send(embed=embed)
+
+
+async def _remote_backups_command(ctx):
+    payload = await _remote_request(ctx, "backup")
+    if not payload:
+        return
+    if not payload.get("configured"):
+        return await ctx.send(
+            f"❌ Backup no configurado en **{_remote_name()}**."
+        )
+    if not payload.get("exists"):
+        return await ctx.send(
+            f"❌ El repositorio de backup de **{_remote_name()}** no existe."
+        )
+    timestamp = payload.get("last_timestamp")
+    if not timestamp:
+        return await ctx.send(
+            f"❌ No se encontró `index.*` en el backup de **{_remote_name()}**."
+        )
+    modified = datetime.fromtimestamp(timestamp)
+    age = datetime.now() - modified
+    healthy = age < timedelta(hours=25)
+    embed = _remote_embed(
+        f"💾 Backup Borg — {_remote_name()}",
+        color=0x2ecc71 if healthy else 0xff0000,
+    )
+    embed.add_field(
+        name="Índice", value=f"`{payload.get('index', '?')}`", inline=False
+    )
+    embed.add_field(
+        name="Última ejecución",
+        value=modified.strftime("%d/%m/%Y %H:%M"),
+        inline=True,
+    )
+    embed.add_field(
+        name="Antigüedad", value=str(age).split(".")[0], inline=True
+    )
+    embed.add_field(
+        name="Tamaño repo",
+        value=format_bytes(payload.get("size", 0)),
+        inline=True,
+    )
+    embed.add_field(
+        name="Estado",
+        value="✅ Al día" if healthy else "🔴 Desactualizado",
+        inline=False,
+    )
+    await ctx.send(embed=embed)
+
+
 # ==========================================
 # EVENTOS Y TAREAS
 # ==========================================
@@ -789,6 +1376,15 @@ async def on_ready():
         watch_fail2ban.start()
     if cloudflare_client is not None and not watch_cloudflare_access.is_running():
         watch_cloudflare_access.start()
+    if remote_arch is not None:
+        for task in [
+            watch_remote_arch,
+            watch_remote_security,
+            watch_remote_docker,
+            watch_remote_backups,
+        ]:
+            if not task.is_running():
+                task.start()
 
     # FIX: evitar lanzar multiples instancias del watcher en reconexiones
     if not getattr(bot, '_ssh_watcher_started', False):
@@ -813,6 +1409,11 @@ async def on_ready():
             "**Mantenimiento**\n"
             "`!updates`   Actualizaciones\n"
             "`!backups`   Estado de backups\n\n"
+            "**Nodo Arch unificado**\n"
+            "`!arch`      Panel remoto\n"
+            "`!arch help` Comandos del nodo remoto\n"
+            "_También podés agregar `arch`: `!status arch`, "
+            "`!logs <s> arch`._\n\n"
             "**Red y alarmas**\n"
             "`!red`       Diagnóstico por capas\n"
             "`!speedtest` Medición contra baseline\n"
@@ -838,6 +1439,389 @@ async def on_ready():
         embed.add_field(name="Servicios vigilados", value=f"`{svc_str}`", inline=False)
         embed.set_footer(text=f"Iniciado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
         await channel.send(embed=embed)
+
+
+@tasks.loop(minutes=1)
+async def watch_remote_arch():
+    """Collect and correlate the remote node without granting a remote shell."""
+    global remote_last_snapshot, remote_consecutive_failures, remote_down_since
+    global remote_network_down_since
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or remote_arch is None:
+        return
+    try:
+        snapshot = await remote_arch.request("snapshot")
+    except RemoteHostError as error:
+        remote_consecutive_failures += 1
+        if remote_consecutive_failures == 2:
+            remote_down_since = datetime.now()
+            remote_stats_counter["agent_failures"] += 1
+            await channel.send(embed=_remote_embed(
+                f"🔴 Nodo sin respuesta — {_remote_name()}",
+                description=(
+                    "Fallaron dos consultas consecutivas al agente restringido.\n"
+                    f"`{str(error)[:500]}`"
+                ),
+                color=0xe74c3c,
+            ))
+        return
+
+    now = datetime.now()
+    if remote_consecutive_failures >= 2:
+        duration = (
+            now - remote_down_since if remote_down_since else timedelta()
+        )
+        await channel.send(embed=_remote_embed(
+            f"🟢 Nodo recuperado — {_remote_name()}",
+            description=f"Volvió a responder tras **{str(duration).split('.')[0]}**.",
+            color=0x2ecc71,
+        ))
+    remote_consecutive_failures = 0
+    remote_down_since = None
+    remote_last_snapshot = snapshot
+    remote_history_time.append(now)
+    remote_history_cpu.append(float(snapshot.get("cpu_percent", 0)))
+    remote_history_ram.append(float(snapshot.get("ram_percent", 0)))
+    remote_history_disk.append(float(snapshot.get("disk_percent", 0)))
+    remote_history_swap.append(float(snapshot.get("swap_percent", 0)))
+
+    temperatures_now = snapshot.get("temperatures") or {}
+    metrics = {
+        "cpu": snapshot.get("cpu_percent"),
+        "ram": snapshot.get("ram_percent"),
+        "disco": snapshot.get("disk_percent"),
+        "swap": snapshot.get("swap_percent"),
+        "temp": max(temperatures_now.values()) if temperatures_now else None,
+    }
+    for event in remote_alarm_engine.evaluate(metrics):
+        await channel.send(embed=_remote_alarm_embed(event, snapshot))
+
+    for service, status in (snapshot.get("services") or {}).items():
+        previous = remote_last_service_status.get(service)
+        if previous == "active" and status != "active":
+            remote_stats_counter["service_alerts"] += 1
+            await channel.send(embed=_remote_embed(
+                f"🔴 Servicio caído — {_remote_name()}",
+                description=f"`{service}` pasó a **{status}**.",
+                color=0xe74c3c,
+            ))
+        elif previous is not None and previous != "active" and status == "active":
+            await channel.send(embed=_remote_embed(
+                f"🟢 Servicio recuperado — {_remote_name()}",
+                description=f"`{service}` volvió a **active**.",
+                color=0x2ecc71,
+            ))
+        remote_last_service_status[service] = status
+
+    if not snapshot.get("network_up", False):
+        if remote_network_down_since is None:
+            remote_network_down_since = now
+            await channel.send(embed=_remote_embed(
+                f"🌐 Red caída — {_remote_name()}",
+                description="El nodo responde por LAN, pero no alcanza Internet.",
+                color=0xe74c3c,
+            ))
+    elif remote_network_down_since is not None:
+        duration = now - remote_network_down_since
+        await channel.send(embed=_remote_embed(
+            f"🌐 Red restaurada — {_remote_name()}",
+            description=f"Internet volvió tras **{str(duration).split('.')[0]}**.",
+            color=0x2ecc71,
+        ))
+        remote_network_down_since = None
+
+
+def _remember_remote_security(key):
+    if key in remote_security_seen:
+        return False
+    if len(remote_security_seen_order) == remote_security_seen_order.maxlen:
+        remote_security_seen.discard(remote_security_seen_order.popleft())
+    remote_security_seen.add(key)
+    remote_security_seen_order.append(key)
+    return True
+
+
+async def _notify_remote_ssh_login(channel, event, timestamp):
+    remote_stats_counter["ssh_events"] += 1
+    origin_ip = event["ip"]
+    cloudflare_event = None
+    if is_loopback(origin_ip) and CLOUDFLARE_ACCESS_APP:
+        cloudflare_event = security_events.latest_cloudflare_access(
+            max_age_seconds=CLOUDFLARE_CORRELATION_SECONDS,
+            now=timestamp,
+        )
+    real_ip = cloudflare_event.ip if cloudflare_event else origin_ip
+    country = (
+        _country_from_event(cloudflare_event)
+        if cloudflare_event else country_resolver.resolve(real_ip)
+    )
+    remote_security_events.add(
+        "ssh_login",
+        ip=real_ip,
+        user=event.get("user", ""),
+        timestamp=timestamp,
+        transport_ip=origin_ip,
+        country=country.label if country else "",
+        country_source=country.source if country else "",
+    )
+    is_local = any(real_ip.startswith(subnet) for subnet in SAFE_SUBNETS)
+    embed = _remote_embed(
+        f"🔑 Nuevo Login SSH — {_remote_name()}",
+        color=0x2ecc71 if is_local else 0xe67e22,
+    )
+    embed.add_field(
+        name="👤 Usuario", value=f"`{event.get('user', '?')}`", inline=True
+    )
+    embed.add_field(
+        name="🌐 IP pública (Cloudflare)" if cloudflare_event else "🌐 IP observada",
+        value=f"`{real_ip}`",
+        inline=True,
+    )
+    embed.add_field(
+        name="🏠 Origen",
+        value="Red local" if is_local else "⚠️ IP externa",
+        inline=True,
+    )
+    if cloudflare_event:
+        embed.add_field(
+            name="☁️ Cloudflare Access",
+            value=(
+                f"`{cloudflare_event.user or 'usuario desconocido'}` · "
+                f"Ray `{cloudflare_event.metadata.get('ray_id') or '?'}`\n"
+                "Correlación temporal; sshd vio "
+                f"`{origin_ip}`."
+            ),
+            inline=False,
+        )
+    _add_country_field(embed, country)
+    await channel.send(embed=embed)
+
+
+async def _notify_remote_ssh_fail(channel, event, timestamp):
+    remote_stats_counter["ssh_fails"] += 1
+    ip = event.get("ip") or "desconocida"
+    remote_security_events.add(
+        "ssh_fail",
+        ip=ip,
+        user=event.get("user", ""),
+        timestamp=timestamp,
+    )
+    summary = remote_security_events.summarize_ip(
+        ip,
+        now=timestamp,
+        max_age_seconds=REMOTE_ARCH_SSH_FAIL_WINDOW,
+    )
+    key = f"bruteforce:{ip}"
+    now = datetime.now()
+    if (
+        summary["ssh_fails"] >= REMOTE_ARCH_SSH_FAIL_THRESHOLD
+        and now - remote_last_alert_time.get(key, datetime.min) > ALERT_COOLDOWN
+    ):
+        embed = _remote_embed(
+            f"🚨 Posible Brute Force SSH — {_remote_name()}",
+            description=(
+                f"**{summary['ssh_fails']} intentos fallidos correlacionados** "
+                "desde la misma IP."
+            ),
+            color=0xff0000,
+        )
+        embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
+        _add_country_field(embed, country_resolver.resolve(ip))
+        if summary["users"]:
+            embed.add_field(
+                name="👥 Usuarios probados",
+                value=", ".join(
+                    f"`{user}`" for user in summary["users"][:10]
+                ),
+                inline=True,
+            )
+        await channel.send(embed=embed)
+        remote_last_alert_time[key] = now
+
+
+async def _notify_remote_fail2ban(channel, event, timestamp):
+    ip = event["ip"]
+    jail = event["jail"]
+    if event["action"] == "unban":
+        remote_security_events.add(
+            "fail2ban_unban", ip=ip, timestamp=timestamp, jail=jail
+        )
+        return
+    remote_stats_counter["fail2ban_bans"] += 1
+    summary = remote_security_events.summarize_ip(ip, now=timestamp)
+    remote_security_events.add(
+        "fail2ban_ban", ip=ip, timestamp=timestamp, jail=jail
+    )
+    embed = _remote_embed(
+        f"⛔ Fail2ban bloqueó una IP — {_remote_name()}",
+        description=f"`{ip}` fue baneada por la jail `{jail}`.",
+        color=0xe74c3c,
+    )
+    _add_country_field(embed, country_resolver.resolve(ip))
+    embed.add_field(
+        name="🔗 Correlación",
+        value=(
+            f"{summary['ssh_fails']} fallo(s) SSH recientes"
+            if summary["ssh_fails"]
+            else "Sin fallos SSH correlacionables en la ventana reciente"
+        ),
+        inline=True,
+    )
+    if summary["users"]:
+        embed.add_field(
+            name="👥 Usuarios probados",
+            value=", ".join(f"`{user}`" for user in summary["users"][:10]),
+            inline=True,
+        )
+    await channel.send(embed=embed)
+
+
+@tasks.loop(minutes=1)
+async def watch_remote_security():
+    global remote_security_since
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or remote_arch is None:
+        return
+    requested_since = remote_security_since - timedelta(seconds=5)
+    try:
+        payload = await remote_arch.request(
+            "security", int(requested_since.timestamp())
+        )
+    except RemoteHostError as error:
+        if DEBUG_MODE:
+            print(f"Remote security watcher: {error}", file=sys.stderr)
+        return
+    newest = remote_security_since
+    for item in payload.get("events") or []:
+        timestamp = parse_timestamp(
+            datetime.fromtimestamp(
+                float(item.get("timestamp", 0)), tz=utcnow().tzinfo
+            )
+        )
+        newest = max(newest, timestamp)
+        message = str(item.get("message") or "")
+        key = (
+            f"{item.get('timestamp', 0)}|{item.get('unit', '')}|{message}"
+        )
+        if not _remember_remote_security(key):
+            continue
+        ssh_event = parse_ssh_line(message)
+        if ssh_event:
+            if ssh_event["kind"] == "ssh_login":
+                await _notify_remote_ssh_login(channel, ssh_event, timestamp)
+            else:
+                await _notify_remote_ssh_fail(channel, ssh_event, timestamp)
+            continue
+        fail2ban_event = parse_fail2ban_log(message)
+        if fail2ban_event:
+            await _notify_remote_fail2ban(
+                channel, fail2ban_event, timestamp
+            )
+    remote_security_since = newest
+
+
+@tasks.loop(minutes=5)
+async def watch_remote_docker():
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or remote_arch is None:
+        return
+    try:
+        payload = await remote_arch.request("docker")
+    except RemoteHostError as error:
+        if DEBUG_MODE:
+            print(f"Remote Docker watcher: {error}", file=sys.stderr)
+        return
+    now = datetime.now()
+    for container in payload.get("containers") or []:
+        name = container.get("name") or ""
+        if not name:
+            continue
+        state = (container.get("state") or "").lower()
+        if state == "restarting":
+            previous_heal = remote_docker_heal_attempts.get(name, datetime.min)
+            if now - previous_heal > HEAL_TIMEOUT:
+                remote_docker_heal_attempts[name] = now
+                try:
+                    await remote_arch.request("heal", name, timeout=70)
+                    remote_stats_counter["docker_alerts"] += 1
+                    await channel.send(embed=_remote_embed(
+                        f"🩹 Auto-Healing — {_remote_name()}",
+                        description=f"`{name}` estaba reiniciando y fue reiniciado.",
+                        color=0x3498db,
+                    ))
+                except RemoteHostError as error:
+                    await channel.send(embed=_remote_embed(
+                        f"🔄 Docker Loop — {_remote_name()}",
+                        description=(
+                            f"`{name}` sigue reiniciando y el intento de "
+                            f"recuperación falló.\n`{str(error)[:500]}`"
+                        ),
+                        color=0xe67e22,
+                    ))
+                continue
+        cpu = float(container.get("cpu", 0))
+        ram = float(container.get("ram", 0))
+        alert_key = f"resource:{name}"
+        if (
+            (cpu > 90 or ram > 90)
+            and now - remote_last_docker_alert.get(
+                alert_key, datetime.min
+            ) > ALERT_COOLDOWN
+        ):
+            embed = _remote_embed(
+                f"🐳 Alto Consumo — {name} — {_remote_name()}",
+                color=0xe67e22,
+            )
+            if cpu > 90:
+                embed.add_field(name="CPU", value=f"**{cpu:.1f}%**", inline=True)
+            if ram > 90:
+                embed.add_field(
+                    name="RAM",
+                    value=f"**{ram:.1f}%** ({container.get('mem_usage', '')})",
+                    inline=True,
+                )
+            await channel.send(embed=embed)
+            remote_last_docker_alert[alert_key] = now
+            remote_stats_counter["docker_alerts"] += 1
+
+
+@tasks.loop(hours=24)
+async def watch_remote_backups():
+    global remote_backup_alerted
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or remote_arch is None:
+        return
+    try:
+        payload = await remote_arch.request("backup")
+    except RemoteHostError as error:
+        if DEBUG_MODE:
+            print(f"Remote backup watcher: {error}", file=sys.stderr)
+        return
+    timestamp = payload.get("last_timestamp")
+    stale = (
+        payload.get("configured")
+        and payload.get("exists")
+        and (
+            not timestamp
+            or datetime.now() - datetime.fromtimestamp(timestamp)
+            > timedelta(hours=25)
+        )
+    )
+    if stale and not remote_backup_alerted:
+        remote_backup_alerted = True
+        await channel.send(embed=_remote_embed(
+            f"🚨 Backup desactualizado — {_remote_name()}",
+            description=(
+                "El repositorio no tiene un índice reciente."
+                if not timestamp else
+                "Último índice: "
+                f"`{datetime.fromtimestamp(timestamp):%d/%m/%Y %H:%M}`."
+            ),
+            color=0xff0000,
+        ))
+    elif not stale:
+        remote_backup_alerted = False
+
 
 @tasks.loop(minutes=1)
 async def collect_history():
@@ -1274,6 +2258,30 @@ async def guardian_report():
     if temps:
         temp_lines = [f"`{k}`: **{v:.0f}°C**" for k, v in sorted(temps.items(), key=lambda x: x[1], reverse=True)[:3]]
         embed.add_field(name="🌡 Temperaturas", value="\n".join(temp_lines), inline=False)
+    if remote_arch is not None:
+        if remote_last_snapshot:
+            remote_temps = remote_last_snapshot.get("temperatures") or {}
+            temp_text = (
+                f" · Temp `{max(remote_temps.values()):.1f}°C`"
+                if remote_temps else " · Temp `sin datos`"
+            )
+            embed.add_field(
+                name=f"🛰 {_remote_name()}",
+                value=(
+                    f"{'🔴' if remote_consecutive_failures >= 2 else '🟢'} "
+                    f"CPU `{remote_last_snapshot.get('cpu_percent', 0):.1f}%` · "
+                    f"RAM `{remote_last_snapshot.get('ram_percent', 0):.1f}%` · "
+                    f"Disco `{remote_last_snapshot.get('disk_percent', 0):.1f}%`"
+                    f"{temp_text}"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name=f"🛰 {_remote_name()}",
+                value="⚪ Aún sin muestra del agente remoto.",
+                inline=False,
+            )
 
     image_data, fleet_result = await asyncio.gather(
         get_chart_image(include_disk=True, last_n=60),
@@ -1338,8 +2346,104 @@ async def guardian_report():
 # ==========================================
 # COMANDOS
 # ==========================================
+@bot.group(name='arch', aliases=['mbp'], invoke_without_command=True)
+async def arch_group(ctx):
+    """Comandos del nodo Arch atendidos por el único Centinela central."""
+    await _remote_status_command(ctx)
+
+
+@arch_group.command(name='help', aliases=['ayuda'])
+async def arch_help(ctx):
+    embed = _remote_embed(
+        f"🛰 Comandos remotos — {_remote_name()}",
+        description=(
+            "`!arch` / `!arch status` — panel de control\n"
+            "`!arch top` — procesos por CPU y RAM\n"
+            "`!arch who` — sesiones activas\n"
+            "`!arch temps` — todos los sensores\n"
+            "`!arch ports` — sockets en escucha\n"
+            "`!arch smart` — salud del disco\n"
+            "`!arch services` — servicios systemd\n"
+            "`!arch ct` — contenedores, puertos y consumo\n"
+            "`!arch logs <contenedor>` — últimas líneas\n"
+            "`!arch restart <contenedor>` — reinicio permitido\n"
+            "`!arch updates` — actualizaciones de Arch\n"
+            "`!arch backups` — estado del Borg\n\n"
+            "También funciona el formato `!status arch`, `!ct arch` o "
+            "`!logs <contenedor> arch`."
+        ),
+    )
+    await ctx.send(embed=embed)
+
+
+@arch_group.command(name='status')
+async def arch_status(ctx):
+    await _remote_status_command(ctx)
+
+
+@arch_group.command(name='top')
+async def arch_top(ctx):
+    await _remote_top_command(ctx)
+
+
+@arch_group.command(name='who')
+async def arch_who(ctx):
+    await _remote_sessions_command(ctx)
+
+
+@arch_group.command(name='temps')
+async def arch_temps(ctx):
+    await _remote_temps_command(ctx)
+
+
+@arch_group.command(name='ports')
+async def arch_ports(ctx):
+    await _remote_ports_command(ctx)
+
+
+@arch_group.command(name='smart')
+async def arch_smart(ctx):
+    await _remote_smart_command(ctx)
+
+
+@arch_group.command(name='services')
+async def arch_services(ctx):
+    await _remote_services_command(ctx)
+
+
+@arch_group.command(name='ct', aliases=['contenedores'])
+async def arch_containers(ctx):
+    await _remote_containers_command(ctx)
+
+
+@arch_group.command(name='logs')
+async def arch_logs(ctx, service: str = None):
+    if not service:
+        return await ctx.send("Uso: `!arch logs <contenedor>`.")
+    await _remote_logs_command(ctx, service)
+
+
+@arch_group.command(name='restart')
+async def arch_restart(ctx, service: str = None):
+    if not service:
+        return await ctx.send("Uso: `!arch restart <contenedor>`.")
+    await _remote_restart_command(ctx, service)
+
+
+@arch_group.command(name='updates')
+async def arch_updates(ctx):
+    await _remote_updates_command(ctx)
+
+
+@arch_group.command(name='backups')
+async def arch_backups(ctx):
+    await _remote_backups_command(ctx)
+
+
 @bot.command(name='status')
-async def server_status(ctx):
+async def server_status(ctx, host: str = None):
+    if _is_remote_alias(host):
+        return await _remote_status_command(ctx)
     msg = await ctx.send("📊 **Analizando...**")
     cpu = psutil.cpu_percent(interval=1)
     ram = psutil.virtual_memory()
@@ -1382,7 +2486,9 @@ async def server_status(ctx):
     await msg.delete()
 
 @bot.command(name='top')
-async def top_processes(ctx):
+async def top_processes(ctx, host: str = None):
+    if _is_remote_alias(host):
+        return await _remote_top_command(ctx)
     # Bajo demanda se toma una muestra corta y propia: da la foto de AHORA en
     # vez del promedio del ultimo minuto que usan las alertas. Va en un thread
     # porque duerme 1s entre las dos lecturas.
@@ -1396,7 +2502,9 @@ async def top_processes(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name='who')
-async def who_online(ctx):
+async def who_online(ctx, host: str = None):
+    if _is_remote_alias(host):
+        return await _remote_sessions_command(ctx)
     sessions = get_active_sessions()
     embed = discord.Embed(title=f"👥 Sesiones Activas — {SERVER_NAME}", color=0x3498db, timestamp=datetime.now())
     if not sessions:
@@ -1412,7 +2520,9 @@ async def who_online(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name='temps')
-async def show_temps(ctx):
+async def show_temps(ctx, host: str = None):
+    if _is_remote_alias(host):
+        return await _remote_temps_command(ctx)
     temps = get_temperatures()
     embed = discord.Embed(title=f"🌡 Temperaturas — {SERVER_NAME}", color=0x3498db, timestamp=datetime.now())
     if not temps:
@@ -1426,7 +2536,9 @@ async def show_temps(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name='ports')
-async def show_ports(ctx):
+async def show_ports(ctx, host: str = None):
+    if _is_remote_alias(host):
+        return await _remote_ports_command(ctx)
     ports = await asyncio.to_thread(get_open_ports)
     embed = discord.Embed(title=f"🔌 Puertos Abiertos — {SERVER_NAME}", color=0x3498db, timestamp=datetime.now())
     if not ports:
@@ -1441,7 +2553,9 @@ async def show_ports(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name='smart')
-async def show_smart(ctx):
+async def show_smart(ctx, host: str = None):
+    if _is_remote_alias(host):
+        return await _remote_smart_command(ctx)
     msg = await ctx.send("🔍 **Leyendo SMART...**")
     result = await asyncio.to_thread(get_smart_health)
     if not result:
@@ -1460,7 +2574,9 @@ async def show_smart(ctx):
     await msg.edit(content=None, embed=embed)
 
 @bot.command(name='services')
-async def show_services(ctx):
+async def show_services(ctx, host: str = None):
+    if _is_remote_alias(host):
+        return await _remote_services_command(ctx)
     if not WATCHED_SERVICES:
         return await ctx.send("❌ `WATCHED_SERVICES` no configurado en `.env`.")
     embed = discord.Embed(title=f"⚙️ Servicios — {SERVER_NAME}", color=0x3498db, timestamp=datetime.now())
@@ -1476,9 +2592,11 @@ async def show_services(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name='logs')
-async def docker_logs(ctx, service: str = None):
+async def docker_logs(ctx, service: str = None, host: str = None):
     if not service:
         return await ctx.send("Uso: `!logs <servicio>` — la lista sale de `!ct`.")
+    if _is_remote_alias(host):
+        return await _remote_logs_command(ctx, service)
     svc, task = await asyncio.to_thread(resolve_service, service)
     if not svc:
         return await ctx.send(f"❌ No encontre un servicio que matchee `{service}`. Mira `!ct`.")
@@ -1489,9 +2607,11 @@ async def docker_logs(ctx, service: str = None):
     await ctx.send(embed=embed)
 
 @bot.command(name='restart')
-async def docker_restart(ctx, service: str = None):
+async def docker_restart(ctx, service: str = None, host: str = None):
     if not service:
         return await ctx.send("Uso: `!restart <servicio>` — la lista sale de `!ct`.")
+    if _is_remote_alias(host):
+        return await _remote_restart_command(ctx, service)
     svc, task = await asyncio.to_thread(resolve_service, service)
     if not svc:
         return await ctx.send(f"❌ No encontre un servicio que matchee `{service}`. Mira `!ct`.")
@@ -1513,13 +2633,15 @@ async def docker_restart(ctx, service: str = None):
     await msg.edit(content=None, embed=embed)
 
 @bot.command(name='ct', aliases=['contenedores'])
-async def check_containers(ctx):
+async def check_containers(ctx, host: str = None):
     """Estado en vivo de los contenedores.
 
     Se llama !ct y no !docker a proposito: !docker es del Updates-Bot, que maneja
     las actualizaciones de imagen de toda la flota. Este muestra runtime (Up,
     CPU, RAM, puertos), que aquel no cubre.
     """
+    if _is_remote_alias(host):
+        return await _remote_containers_command(ctx)
     if not shutil.which("docker"):
         return await ctx.send("🐳 Docker no instalado.")
     tasks_now = await asyncio.to_thread(list_tasks)
@@ -1554,7 +2676,9 @@ async def check_containers(ctx):
     await ctx.send(embed=embed)
 
 @bot.command(name='updates')
-async def check_os_updates(ctx):
+async def check_os_updates(ctx, host: str = None):
+    if _is_remote_alias(host):
+        return await _remote_updates_command(ctx)
     if DISTRO == "unknown":
         return await ctx.send("❌ Distro no soportada.")
     pkg_mgr = "pacman" if DISTRO == "arch" else "apt"
@@ -1572,7 +2696,9 @@ async def check_os_updates(ctx):
     await msg.edit(content=None, embed=embed)
 
 @bot.command(name='backups')
-async def check_backups(ctx):
+async def check_backups(ctx, host: str = None):
+    if _is_remote_alias(host):
+        return await _remote_backups_command(ctx)
     if not BACKUP_PATH:
         return await ctx.send("❌ `BACKUP_PATH` no configurado.")
     if not os.path.exists(BACKUP_PATH):
@@ -1911,4 +3037,5 @@ def signal_handler(s, f):
 
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
-bot.run(TOKEN)
+if __name__ == "__main__":
+    bot.run(TOKEN)

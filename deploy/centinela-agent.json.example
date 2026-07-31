@@ -1,0 +1,20 @@
+{
+  "name": "server-mbp",
+  "watched_services": [
+    "docker",
+    "sshd",
+    "nginx"
+  ],
+  "allowed_restart": [
+    "truly-postgres",
+    "truly-valkey",
+    "truly-api"
+  ],
+  "backup_path": "/home/luca/Docker/db-truly/borgmatic",
+  "smart_devices": [
+    "/dev/sda",
+    "/dev/nvme0n1",
+    "/dev/nvme0",
+    "/dev/vda"
+  ]
+}

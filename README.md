@@ -20,6 +20,53 @@ A Discord bot for monitoring and securing Linux servers (multi-distro: Arch / De
 - **Correlated security events:** SSH failures are grouped by source IP and users attempted; a Fail2ban ban is enriched with those preceding attempts. The watcher uses `fail2ban-client` when permitted and falls back to the read-only Fail2ban journal.
 - **Traceable Cloudflare Access logins (optional):** polls the official Zero Trust Access authentication-log API and reports identity, the public client IP observed by Cloudflare, application and Ray ID. For SSH/TCP, where the origin can only see the `cloudflared` process address, a local SSH login is explicitly marked as a time-based correlation with the latest allowed Access event.
 - **Private GeoIP enrichment:** Access, SSH brute-force and Fail2ban alerts include the country estimated from the public IP. A country supplied by Cloudflare is preferred; otherwise Centinela reads a local Country MMDB (DB-IP Lite or MaxMind GeoLite2) and caches results. Client IPs are never sent to a third-party geolocation API. Country is context, not proof of physical location: VPNs, proxies and mobile/CGNAT networks may report their exit country.
+- **One bot for Pentium + Arch:** the Discord bot runs only on Pentium and also
+  monitors `server-mbp` through a constrained collector. The collector key has
+  `restrict` plus an OpenSSH forced command: it cannot start a shell, forward
+  ports or execute arbitrary commands. Metrics, temperatures, services,
+  sessions, ports, Docker, backups, SSH/fail2ban events and allowed restarts are
+  exposed as typed JSON operations.
+- **Container + native-service endpoints in Grafana:** a read-only local
+  discovery timer exports published container ports, container-network
+  endpoints and listening systemd services as
+  `centinela_runtime_endpoint_info`. The `Contenedores + servicios` dashboard
+  shows host, runtime, service, IP, port, protocol, endpoint and exposure scope.
+  Wildcard binds are rendered with the host's real LAN address; localhost stays
+  explicitly marked local.
+
+### 🛰 Unified Arch node
+
+The old Arch Discord process is not needed. Once the central node is configured,
+the same bot exposes both command styles:
+
+```
+!arch                         # remote status
+!arch help                    # complete remote command list
+!arch ct                      # containers, published IP/ports and resources
+!arch logs truly-api
+!arch restart truly-api       # only names in the remote allowlist
+
+!status arch                  # equivalent suffix form
+!temps arch
+!logs truly-api arch
+```
+
+Four central loops supervise the remote node: resource/service/network state,
+SSH and Fail2ban correlation, Docker resource/loop recovery, and Borg freshness.
+Each has independent history, deduplication and cooldown state, so an event on
+Arch cannot inflate or suppress a Pentium alert. Country lookup remains local.
+
+The remote side is installed with
+`deploy/install-remote-agent.sh`, using
+`deploy/centinela-agent.json.example` as the explicit service/restart policy.
+`deploy/configure-remote-env.py` updates only the allowlisted `REMOTE_ARCH_*`
+keys atomically and never prints or rewrites Discord/Cloudflare secrets.
+
+Endpoint inventory uses `runtime_discovery.py` and the units under `deploy/`.
+It reads Docker metadata, listening sockets and `/proc` cgroups as a oneshot
+root service, writes only one atomic Prometheus textfile, and is sandboxed by
+systemd. `deploy/update-grafana-runtime-panel.py` backs up both affected
+dashboards before applying the idempotent panel/link update.
 
 ### 🤝 Split with the Updates-Bot
 
@@ -192,6 +239,7 @@ See [`.env.example`](./.env.example) for the full list:
 | `SPEEDTEST_ENABLED` / `SPEEDTEST_EVERY_HOURS` / `SPEEDTEST_COOLDOWN_MIN` | Periodic measurement and rate limiting |
 | `SPEEDTEST_SLOW_RATIO` / `SPEEDTEST_DEGRADED_RATIO` | Thresholds as a fraction of your median. Loose on purpose: this link swings 26% between back-to-back runs |
 | `QUIET_HOURS_ENABLED` / `QUIET_HOURS_START` / `QUIET_HOURS_END` | Night window where only critical alarms notify |
+| `REMOTE_ARCH_*` | Optional constrained SSH collector for the unified Arch node: address, identity, host-key file and independent alarm/security thresholds |
 
 ## 📄 License
 

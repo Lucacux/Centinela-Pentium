@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh container and systemd service endpoint inventory
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+RandomizedDelaySec=10s
+Persistent=true
+Unit=centinela-runtime-discovery.service
+
+[Install]
+WantedBy=timers.target
