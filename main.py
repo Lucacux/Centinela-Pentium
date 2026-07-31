@@ -14,6 +14,20 @@ from collections import deque
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from grafana import GrafanaClient, GrafanaError, parse_range
+from fleet_report import render_fleet_pages
+from ip_geolocation import CountryEstimate, CountryResolver
+from security_events import (
+    CloudflareAccessClient,
+    EventCorrelator,
+    cloudflare_event_id,
+    is_loopback,
+    parse_timestamp,
+    parse_fail2ban_banned,
+    parse_fail2ban_jails,
+    parse_fail2ban_log,
+    parse_ssh_line,
+    utcnow,
+)
 from docker_ops import (
     docker_cmd,
     get_docker_stats,
@@ -38,6 +52,17 @@ SSH_FAIL_THRESHOLD = int(os.getenv('SSH_FAIL_THRESHOLD', '10'))
 SSH_FAIL_WINDOW = int(os.getenv('SSH_FAIL_WINDOW', '120'))
 SWAP_ALERT_PCT = int(os.getenv('SWAP_ALERT_PCT', '50'))
 TEMP_ALERT_C = int(os.getenv('TEMP_ALERT_C', '85'))
+FAIL2BAN_ENABLED = os.getenv(
+    'FAIL2BAN_ENABLED', 'true'
+).lower() in ('true', '1', 'yes')
+CLOUDFLARE_ACCOUNT_ID = os.getenv('CLOUDFLARE_ACCOUNT_ID', '').strip()
+CLOUDFLARE_ACCESS_TOKEN = os.getenv('CLOUDFLARE_ACCESS_TOKEN', '').strip()
+CLOUDFLARE_ACCESS_APP = os.getenv('CLOUDFLARE_ACCESS_APP', '').strip().lower()
+CLOUDFLARE_CORRELATION_SECONDS = int(
+    os.getenv('CLOUDFLARE_CORRELATION_SECONDS', '180')
+)
+GEOIP_COUNTRY_DB = os.getenv('GEOIP_COUNTRY_DB', '').strip()
+GEOIP_COUNTRY_LOCALE = os.getenv('GEOIP_COUNTRY_LOCALE', 'es').strip()
 
 # --- GRAFANA (feature opcional: paneles del dashboard en el bot) ---
 # Todo se descubre en caliente via la API; no se hardcodea ningun dashboard/panel.
@@ -57,18 +82,26 @@ GRAFANA_GUARDIAN_ENABLED = os.getenv(
 GRAFANA_GUARDIAN_DASHBOARD = os.getenv(
     'GRAFANA_GUARDIAN_DASHBOARD', 'fleet-overview'
 ).strip()
-GRAFANA_GUARDIAN_PANEL = os.getenv(
-    'GRAFANA_GUARDIAN_PANEL', 'Estado de nodos'
-).strip()
 GRAFANA_GUARDIAN_RANGE = os.getenv(
-    'GRAFANA_GUARDIAN_RANGE', '15m'
+    'GRAFANA_GUARDIAN_RANGE', '6h'
 ).strip()
-GRAFANA_GUARDIAN_W = int(os.getenv('GRAFANA_GUARDIAN_WIDTH', '1200'))
-GRAFANA_GUARDIAN_H = int(os.getenv('GRAFANA_GUARDIAN_HEIGHT', '700'))
+GRAFANA_GUARDIAN_W = int(os.getenv('GRAFANA_GUARDIAN_WIDTH', '1600'))
+GRAFANA_GUARDIAN_H = int(os.getenv('GRAFANA_GUARDIAN_HEIGHT', '1600'))
+GRAFANA_GUARDIAN_PAGE_H = int(
+    os.getenv('GRAFANA_GUARDIAN_PAGE_HEIGHT', '900')
+)
 
 grafana_client = (
     GrafanaClient(GRAFANA_URL, GRAFANA_TOKEN)
     if GRAFANA_URL and GRAFANA_TOKEN else None
+)
+cloudflare_client = (
+    CloudflareAccessClient(CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ACCESS_TOKEN)
+    if CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_ACCESS_TOKEN else None
+)
+country_resolver = CountryResolver(
+    database_path=GEOIP_COUNTRY_DB,
+    locale=GEOIP_COUNTRY_LOCALE,
 )
 
 if not TOKEN or not CHANNEL_ID_ENV:
@@ -115,11 +148,17 @@ history_ram = deque(maxlen=HISTORY_LEN)
 history_disk = deque(maxlen=HISTORY_LEN)
 history_swap = deque(maxlen=HISTORY_LEN)
 
-stats_counter = {"ssh_events": 0, "ssh_fails": 0, "docker_alerts": 0, "service_alerts": 0}
+stats_counter = {
+    "ssh_events": 0,
+    "ssh_fails": 0,
+    "docker_alerts": 0,
+    "service_alerts": 0,
+    "fail2ban_bans": 0,
+    "cloudflare_access": 0,
+}
 last_alert_time = {
     "cpu": datetime.min, "ram": datetime.min, "disk": datetime.min,
     "swap": datetime.min, "temp": datetime.min, "network": datetime.min,
-    "bruteforce": datetime.min,
 }
 ALERT_COOLDOWN = timedelta(hours=1)
 last_docker_alert = {}
@@ -130,13 +169,42 @@ HEAL_TIMEOUT = timedelta(hours=1)
 cpu_high_streak = 0
 ram_high_streak = 0
 
-ssh_fail_timestamps = deque(maxlen=500)
 last_service_status = {}
 network_was_down = False
+security_events = EventCorrelator(window_seconds=900)
+fail2ban_banned = {}
+active_ban_notifications = set()
+fail2ban_journal_since = utcnow() - timedelta(minutes=2)
+cloudflare_seen = set()
+cloudflare_seen_order = deque(maxlen=2000)
+cloudflare_since = utcnow() - timedelta(minutes=2)
 
 # ==========================================
 # HELPERS VISUALES
 # ==========================================
+def _country_from_event(event):
+    if event is None:
+        return None
+    label = str(event.metadata.get("country") or "")
+    if label:
+        return CountryEstimate(
+            name=label,
+            source=str(event.metadata.get("country_source") or ""),
+        )
+    return country_resolver.resolve(event.ip)
+
+
+def _add_country_field(embed, country):
+    if country is None:
+        return
+    source = f"\nFuente: `{country.source}`" if country.source else ""
+    embed.add_field(
+        name="🌍 País estimado por IP",
+        value=f"`{country.label}`{source}",
+        inline=True,
+    )
+
+
 def make_bar(value, length=12):
     pct = max(0.0, min(100.0, float(value)))
     filled = round(pct / 100 * length)
@@ -325,7 +393,31 @@ def check_network():
         return False
 
 def get_service_status(service_name):
-    return subprocess.getoutput(f"systemctl is-active {service_name} 2>/dev/null").strip()
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", service_name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return result.stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def get_service_logs(service_name, lines=5):
+    try:
+        result = subprocess.run(
+            ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 # ==========================================
 # HELPER BACKUP BORG
@@ -400,49 +492,98 @@ async def _watch_ssh_file(channel, log_file):
 
 async def _process_ssh_login(channel, line):
     stats_counter["ssh_events"] += 1
-    try:
-        parts = line.split()
-        user = parts[parts.index("for") + 1]
-        ip = parts[parts.index("from") + 1]
-        is_local = any(ip.startswith(s) for s in SAFE_SUBNETS)
-        embed = discord.Embed(title="🔑 Nuevo Login SSH", color=0x2ecc71 if is_local else 0xe67e22)
-        embed.add_field(name="👤 Usuario", value=f"`{user}`", inline=True)
-        embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-        embed.add_field(name="🏠 Origen", value="Red local" if is_local else "⚠️ IP externa", inline=True)
-        embed.set_footer(text=datetime.now().strftime('%H:%M:%S'))
-        await channel.send(embed=embed)
-    except Exception:
-        pass
+    event = parse_ssh_line(line)
+    if not event:
+        return
+    user = event["user"]
+    origin_ip = event["ip"]
+    cf_event = None
+    if is_loopback(origin_ip) and CLOUDFLARE_ACCESS_APP:
+        cf_event = security_events.latest_cloudflare_access(
+            max_age_seconds=CLOUDFLARE_CORRELATION_SECONDS
+        )
+    real_ip = cf_event.ip if cf_event else origin_ip
+    country = (
+        _country_from_event(cf_event)
+        if cf_event else country_resolver.resolve(real_ip)
+    )
+    security_events.add(
+        "ssh_login",
+        ip=real_ip,
+        user=user,
+        transport_ip=origin_ip,
+        cloudflare_ray=cf_event.metadata.get("ray_id") if cf_event else "",
+        country=country.label if country else "",
+        country_source=country.source if country else "",
+    )
+    is_local = any(real_ip.startswith(s) for s in SAFE_SUBNETS)
+    embed = discord.Embed(
+        title="🔑 Nuevo Login SSH",
+        color=0x2ecc71 if is_local else 0xe67e22,
+    )
+    embed.add_field(name="👤 Usuario", value=f"`{user}`", inline=True)
+    embed.add_field(
+        name="🌐 IP pública (Cloudflare)" if cf_event else "🌐 IP observada",
+        value=f"`{real_ip}`",
+        inline=True,
+    )
+    embed.add_field(
+        name="🏠 Origen",
+        value="Red local" if is_local else "⚠️ IP externa",
+        inline=True,
+    )
+    if cf_event:
+        embed.add_field(
+            name="☁️ Cloudflare Access",
+            value=(
+                f"`{cf_event.user or 'usuario desconocido'}` · "
+                f"Ray `{cf_event.metadata.get('ray_id') or '?'}`\n"
+                f"Correlación temporal ({CLOUDFLARE_CORRELATION_SECONDS}s); "
+                f"sshd vio `{origin_ip}`."
+            ),
+            inline=False,
+        )
+    _add_country_field(embed, country)
+    embed.set_footer(text=datetime.now().strftime('%H:%M:%S'))
+    await channel.send(embed=embed)
 
 async def _process_ssh_fail(channel, line):
     stats_counter["ssh_fails"] += 1
     now = datetime.now()
-    ssh_fail_timestamps.append(now)
+    event = parse_ssh_line(line)
+    ip = event["ip"] if event else "desconocida"
+    user = event["user"] if event else ""
+    security_events.add("ssh_fail", ip=ip, user=user)
 
-    cutoff = now - timedelta(seconds=SSH_FAIL_WINDOW)
-    while ssh_fail_timestamps and ssh_fail_timestamps[0] < cutoff:
-        ssh_fail_timestamps.popleft()
-
-    recent_fails = len(ssh_fail_timestamps)
-    if recent_fails >= SSH_FAIL_THRESHOLD and (now - last_alert_time["bruteforce"] > ALERT_COOLDOWN):
-        ip = "desconocida"
-        try:
-            parts = line.split()
-            if "from" in parts:
-                ip = parts[parts.index("from") + 1]
-        except Exception:
-            pass
-
+    summary = security_events.summarize_ip(
+        ip, max_age_seconds=SSH_FAIL_WINDOW
+    )
+    recent_fails = summary["ssh_fails"]
+    alert_key = f"bruteforce:{ip}"
+    if (
+        recent_fails >= SSH_FAIL_THRESHOLD
+        and now - last_alert_time.get(alert_key, datetime.min) > ALERT_COOLDOWN
+    ):
         embed = discord.Embed(
             title="🚨 Posible Brute Force SSH",
-            description=f"**{recent_fails} intentos fallidos** en los ultimos {SSH_FAIL_WINDOW}s.",
+            description=(
+                f"**{recent_fails} intentos fallidos correlacionados** "
+                f"desde la misma IP."
+            ),
             color=0xff0000
         )
         embed.add_field(name="🌐 Ultima IP", value=f"`{ip}`", inline=True)
+        _add_country_field(embed, country_resolver.resolve(ip))
+        if summary["users"]:
+            embed.add_field(
+                name="👥 Usuarios probados",
+                value=", ".join(f"`{item}`" for item in summary["users"][:10]),
+                inline=True,
+            )
         embed.add_field(name="🛡 Recomendacion", value="Revisar fail2ban / firewall", inline=True)
         embed.set_footer(text=now.strftime('%H:%M:%S'))
         await channel.send(embed=embed)
-        last_alert_time["bruteforce"] = now
+        last_alert_time[alert_key] = now
 
 # ==========================================
 # GENERADOR DE GRAFICOS
@@ -491,25 +632,25 @@ async def get_chart_image(include_disk=False, last_n=20):
 
 
 async def get_guardian_fleet_image():
-    """Captura el estado de la flota que acompana al Guardian Report."""
+    """Captura el Fleet Overview completo y lo pagina para Discord."""
     if (
         grafana_client is None
         or not GRAFANA_GUARDIAN_ENABLED
         or not GRAFANA_GUARDIAN_DASHBOARD
-        or not GRAFANA_GUARDIAN_PANEL
     ):
         return None
 
     from_expr, to_expr = parse_range(
         GRAFANA_GUARDIAN_RANGE, GRAFANA_DEFAULT_RANGE
     )
-    return await grafana_client.render_panel_by_ref(
+    return await render_fleet_pages(
+        grafana_client,
         GRAFANA_GUARDIAN_DASHBOARD,
-        GRAFANA_GUARDIAN_PANEL,
         from_expr,
         to_expr,
         GRAFANA_GUARDIAN_W,
         GRAFANA_GUARDIAN_H,
+        GRAFANA_GUARDIAN_PAGE_H,
         GRAFANA_THEME,
         GRAFANA_TZ,
     )
@@ -527,6 +668,10 @@ async def on_ready():
         watch_backups.start()
     if WATCHED_SERVICES and not watch_services.is_running():
         watch_services.start()
+    if FAIL2BAN_ENABLED and not watch_fail2ban.is_running():
+        watch_fail2ban.start()
+    if cloudflare_client is not None and not watch_cloudflare_access.is_running():
+        watch_cloudflare_access.start()
 
     # FIX: evitar lanzar multiples instancias del watcher en reconexiones
     if not getattr(bot, '_ssh_watcher_started', False):
@@ -650,11 +795,11 @@ async def watch_services():
     if not channel or not WATCHED_SERVICES:
         return
     for svc in WATCHED_SERVICES:
-        status = get_service_status(svc)
+        status = await asyncio.to_thread(get_service_status, svc)
         prev = last_service_status.get(svc)
         if prev is not None and prev == "active" and status != "active":
             embed = discord.Embed(title=f"🔴 Servicio Caido: {svc}", description=f"`{svc}` paso a **{status}**.", color=0xff0000)
-            log = subprocess.getoutput(f"journalctl -u {svc} -n 5 --no-pager 2>/dev/null")
+            log = await asyncio.to_thread(get_service_logs, svc, 5)
             if log:
                 embed.add_field(name="Log", value=f"```\n{log[:500]}\n```", inline=False)
             await channel.send(embed=embed)
@@ -663,6 +808,187 @@ async def watch_services():
             embed = discord.Embed(title=f"🟢 Servicio Recuperado: {svc}", color=0x2ecc71)
             await channel.send(embed=embed)
         last_service_status[svc] = status
+
+
+async def _command_output(args, timeout=15):
+    """Run a fixed argv command without a shell and return (ok, stdout)."""
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return result.returncode == 0, result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+
+
+@tasks.loop(minutes=1)
+async def watch_fail2ban():
+    """Notify bans using the client when permitted, journald as fallback."""
+    global fail2ban_journal_since
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        return
+    ok, output = await _command_output(["fail2ban-client", "status"])
+    if not ok:
+        # The control socket is often root-only. The bot already needs journal
+        # read access for sshd, so journald is a safe, read-only fallback.
+        since = fail2ban_journal_since
+        fail2ban_journal_since = utcnow() - timedelta(seconds=5)
+        ok, output = await _command_output([
+            "journalctl", "-u", "fail2ban",
+            "--since", f"@{since.timestamp():.0f}",
+            "--no-pager", "-o", "cat",
+        ])
+        if not ok:
+            return
+        for line in output.splitlines():
+            event = parse_fail2ban_log(line)
+            if not event:
+                continue
+            key = (event["jail"], event["ip"])
+            if event["action"] == "unban":
+                active_ban_notifications.discard(key)
+            elif key not in active_ban_notifications:
+                active_ban_notifications.add(key)
+                await _notify_fail2ban_ban(
+                    channel, event["jail"], event["ip"]
+                )
+        return
+
+    for jail in parse_fail2ban_jails(output):
+        ok, jail_output = await _command_output(
+            ["fail2ban-client", "status", jail]
+        )
+        if not ok:
+            continue
+        current = parse_fail2ban_banned(jail_output)
+        previous = fail2ban_banned.get(jail)
+        fail2ban_banned[jail] = current
+        if previous is None:
+            active_ban_notifications.update((jail, ip) for ip in current)
+            continue  # establish baseline without replaying old bans on restart
+        for ip in previous - current:
+            active_ban_notifications.discard((jail, ip))
+        for ip in sorted(current - previous):
+            key = (jail, ip)
+            if key not in active_ban_notifications:
+                active_ban_notifications.add(key)
+                await _notify_fail2ban_ban(channel, jail, ip)
+
+
+async def _notify_fail2ban_ban(channel, jail, ip):
+    stats_counter["fail2ban_bans"] += 1
+    summary = security_events.summarize_ip(ip)
+    security_events.add("fail2ban_ban", ip=ip, jail=jail)
+    embed = discord.Embed(
+        title="⛔ Fail2ban bloqueó una IP",
+        description=f"`{ip}` fue baneada por la jail `{jail}`.",
+        color=0xe74c3c,
+        timestamp=datetime.now(),
+    )
+    _add_country_field(embed, country_resolver.resolve(ip))
+    embed.add_field(
+        name="🔗 Correlación",
+        value=(
+            f"{summary['ssh_fails']} fallo(s) SSH recientes"
+            if summary["ssh_fails"] else
+            "Sin fallos SSH correlacionables en la ventana reciente"
+        ),
+        inline=True,
+    )
+    if summary["users"]:
+        embed.add_field(
+            name="👥 Usuarios probados",
+            value=", ".join(f"`{user}`" for user in summary["users"][:10]),
+            inline=True,
+        )
+    await channel.send(embed=embed)
+
+
+@tasks.loop(minutes=1)
+async def watch_cloudflare_access():
+    """Poll Access logs: the client public IP is unavailable at an SSH origin."""
+    global cloudflare_since
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or cloudflare_client is None:
+        return
+    try:
+        items = await cloudflare_client.fetch(cloudflare_since)
+    except Exception as error:
+        if DEBUG_MODE:
+            print(f"Cloudflare Access watcher: {error}", file=sys.stderr)
+        return
+
+    for item in sorted(items, key=lambda value: value.get("created_at", "")):
+        item_timestamp = parse_timestamp(item.get("created_at"))
+        if item_timestamp > cloudflare_since:
+            cloudflare_since = item_timestamp
+        event_id = cloudflare_event_id(item)
+        if event_id in cloudflare_seen:
+            continue
+        app_domain = str(item.get("app_domain") or "")
+        if CLOUDFLARE_ACCESS_APP and CLOUDFLARE_ACCESS_APP not in app_domain.lower():
+            continue
+        if len(cloudflare_seen_order) == cloudflare_seen_order.maxlen:
+            cloudflare_seen.discard(cloudflare_seen_order.popleft())
+        cloudflare_seen.add(event_id)
+        cloudflare_seen_order.append(event_id)
+
+        created_at = item.get("created_at")
+        access_ip = str(item.get("ip_address") or "")
+        country = country_resolver.resolve(access_ip, cloudflare_item=item)
+        event = security_events.add(
+            "cloudflare_access",
+            ip=access_ip,
+            user=str(item.get("user_email") or ""),
+            timestamp=created_at,
+            allowed=bool(item.get("allowed")),
+            ray_id=str(item.get("ray_id") or ""),
+            app_domain=app_domain,
+            action=str(item.get("action") or ""),
+            country=country.label if country else "",
+            country_source=country.source if country else "",
+        )
+        stats_counter["cloudflare_access"] += 1
+        allowed = event.metadata["allowed"]
+        embed = discord.Embed(
+            title=(
+                "☁️ Cloudflare Access autorizado"
+                if allowed else "🚫 Cloudflare Access denegado"
+            ),
+            color=0x2ecc71 if allowed else 0xe74c3c,
+            timestamp=datetime.now(),
+        )
+        embed.add_field(
+            name="👤 Identidad",
+            value=f"`{event.user or 'desconocida'}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="🌐 IP pública observada",
+            value=f"`{event.ip or 'desconocida'}`",
+            inline=True,
+        )
+        _add_country_field(embed, country)
+        embed.add_field(
+            name="🎯 Aplicación",
+            value=f"`{app_domain or 'desconocida'}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="🔎 Trazabilidad",
+            value=(
+                f"Ray `{event.metadata['ray_id'] or '?'}` · "
+                f"acción `{event.metadata['action'] or '?'}`"
+            ),
+            inline=False,
+        )
+        await channel.send(embed=embed)
 
 @tasks.loop(minutes=3)
 async def watch_network():
@@ -772,6 +1098,7 @@ async def guardian_report():
     if avg_ram > 70: score -= (avg_ram - 70)
     score -= stats_counter["docker_alerts"] * 15
     score -= stats_counter["service_alerts"] * 20
+    score -= stats_counter["fail2ban_bans"] * 5
     if stats_counter["ssh_fails"] > SSH_FAIL_THRESHOLD: score -= 10
     score = max(0, int(score))
 
@@ -792,6 +1119,8 @@ async def guardian_report():
     embed.add_field(name="🔑 SSH OK", value=f"`{stats_counter['ssh_events']}`", inline=True)
     embed.add_field(name="❌ SSH Fail", value=f"`{stats_counter['ssh_fails']}`", inline=True)
     embed.add_field(name="🐳 Docker", value=f"`{stats_counter['docker_alerts']}`", inline=True)
+    embed.add_field(name="⛔ Bans", value=f"`{stats_counter['fail2ban_bans']}`", inline=True)
+    embed.add_field(name="☁️ Access", value=f"`{stats_counter['cloudflare_access']}`", inline=True)
 
     temps = get_temperatures()
     if temps:
@@ -831,21 +1160,24 @@ async def guardian_report():
             inline=False,
         )
     elif fleet_result is not None:
-        dashboard, panel, fleet_image = fleet_result
-        files.append(discord.File(
-            io.BytesIO(fleet_image), filename="grafana-fleet.png"
-        ))
-        fleet_embed = discord.Embed(
-            title=f"🌐 Grafana — {dashboard['title']}",
-            description=panel["title"],
-            color=GRAFANA_ORANGE,
-            timestamp=datetime.now(),
-        )
-        fleet_embed.set_image(url="attachment://grafana-fleet.png")
-        fleet_embed.set_footer(
-            text=f"Fleet status · rango {GRAFANA_GUARDIAN_RANGE}"
-        )
-        embeds.append(fleet_embed)
+        dashboard, fleet_pages = fleet_result
+        total = len(fleet_pages)
+        for index, fleet_image in enumerate(fleet_pages, start=1):
+            filename = f"grafana-fleet-{index}.png"
+            files.append(discord.File(
+                io.BytesIO(fleet_image), filename=filename
+            ))
+            fleet_embed = discord.Embed(
+                title=f"🌐 Grafana — {dashboard['title']}",
+                description=f"Dashboard completo · página {index}/{total}",
+                color=GRAFANA_ORANGE,
+                timestamp=datetime.now(),
+            )
+            fleet_embed.set_image(url=f"attachment://{filename}")
+            fleet_embed.set_footer(
+                text=f"Fleet Overview · rango {GRAFANA_GUARDIAN_RANGE}"
+            )
+            embeds.append(fleet_embed)
 
     await channel.send(
         files=files or discord.utils.MISSING,
@@ -986,7 +1318,7 @@ async def show_services(ctx):
     embed = discord.Embed(title=f"⚙️ Servicios — {SERVER_NAME}", color=0x3498db, timestamp=datetime.now())
     all_ok = True
     for svc in WATCHED_SERVICES:
-        status = get_service_status(svc)
+        status = await asyncio.to_thread(get_service_status, svc)
         icons = {"active": "🟢", "inactive": "🔴", "failed": "💀"}
         icon = icons.get(status, "🟡")
         if status != "active":
