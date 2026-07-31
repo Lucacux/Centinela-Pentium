@@ -25,6 +25,7 @@ from remote_hosts import RemoteHostClient, RemoteHostConfig, RemoteHostError
 from security_events import (
     CloudflareAccessClient,
     EventCorrelator,
+    access_app_matches,
     classify_ssh_origin,
     cloudflare_event_id,
     is_loopback,
@@ -234,7 +235,10 @@ active_ban_notifications = set()
 fail2ban_journal_since = utcnow() - timedelta(minutes=2)
 cloudflare_seen = set()
 cloudflare_seen_order = deque(maxlen=2000)
+cloudflare_claimed = set()
+cloudflare_claimed_order = deque(maxlen=2000)
 cloudflare_since = utcnow() - timedelta(minutes=2)
+cloudflare_last_error_log = None
 # Capa culpable del ultimo corte ("wan", "dns", ...) o None si la red esta sana.
 # Guardar la CAPA y no un bool permite avisar cuando la falla se MUEVE de lugar
 # (p.ej. vuelve la WAN pero ahora lo roto es el DNS): con un bool eso pasaba
@@ -341,6 +345,184 @@ def _add_country_field(embed, country):
         value=f"`{country.label}`{source}",
         inline=True,
     )
+
+
+def _remember_bounded(value, members, order):
+    if value in members:
+        return False
+    if len(order) == order.maxlen:
+        members.discard(order.popleft())
+    members.add(value)
+    order.append(value)
+    return True
+
+
+def _claim_cloudflare_event(event):
+    event_id = str(event.metadata.get("event_id") or "") if event else ""
+    if not event_id:
+        return False
+    return _remember_bounded(
+        event_id, cloudflare_claimed, cloudflare_claimed_order
+    )
+
+
+def _cloudflare_correlation_note(status, origin_ip):
+    prefix = f"`sshd` recibió `{origin_ip}` desde el proxy local. "
+    if status == "missing_app":
+        return (
+            prefix
+            + "La API está configurada, pero falta `CLOUDFLARE_ACCESS_APP`; "
+            "no se correlaciona entre aplicaciones por seguridad."
+        )
+    if status == "api_error":
+        return (
+            prefix
+            + "La consulta de Access falló; se conservó la IP observada para "
+            "no atribuir una IP pública sin evidencia."
+        )
+    if status == "not_found":
+        return (
+            prefix
+            + "La API fue consultada, pero no apareció un acceso autorizado "
+            f"para la aplicación dentro de ±{CLOUDFLARE_CORRELATION_SECONDS}s."
+        )
+    return (
+        prefix
+        + "La IP pública, el usuario de Access y el Ray ID no están "
+        "disponibles hasta configurar la API de Access."
+    )
+
+
+def _ingest_cloudflare_item(item):
+    """Add one matching API item once and return its event plus country."""
+    global cloudflare_since
+    item_timestamp = parse_timestamp(item.get("created_at"))
+    if item_timestamp > cloudflare_since:
+        cloudflare_since = item_timestamp
+
+    app_domain = str(item.get("app_domain") or "")
+    if not access_app_matches(CLOUDFLARE_ACCESS_APP, app_domain):
+        return None
+    event_id = cloudflare_event_id(item)
+    if not _remember_bounded(
+        event_id, cloudflare_seen, cloudflare_seen_order
+    ):
+        return None
+
+    access_ip = str(item.get("ip_address") or "")
+    country = country_resolver.resolve(access_ip, cloudflare_item=item)
+    event = security_events.add(
+        "cloudflare_access",
+        ip=access_ip,
+        user=str(item.get("user_email") or ""),
+        timestamp=item.get("created_at"),
+        allowed=bool(item.get("allowed")),
+        event_id=event_id,
+        ray_id=str(item.get("ray_id") or ""),
+        app_domain=app_domain,
+        action=str(item.get("action") or ""),
+        country=country.label if country else "",
+        country_source=country.source if country else "",
+    )
+    stats_counter["cloudflare_access"] += 1
+    return event, country
+
+
+async def _notify_cloudflare_access(channel, event, country):
+    allowed = event.metadata["allowed"]
+    embed = discord.Embed(
+        title=(
+            "☁️ Cloudflare Access autorizado"
+            if allowed else "🚫 Cloudflare Access denegado"
+        ),
+        color=0x2ecc71 if allowed else 0xe74c3c,
+        timestamp=datetime.now(),
+    )
+    embed.add_field(
+        name="👤 Identidad",
+        value=f"`{event.user or 'desconocida'}`",
+        inline=True,
+    )
+    embed.add_field(
+        name="🌐 IP pública observada",
+        value=f"`{event.ip or 'desconocida'}`",
+        inline=True,
+    )
+    _add_country_field(embed, country)
+    embed.add_field(
+        name="🎯 Aplicación",
+        value=f"`{event.metadata['app_domain'] or 'desconocida'}`",
+        inline=False,
+    )
+    embed.add_field(
+        name="🔎 Trazabilidad",
+        value=(
+            f"Ray `{event.metadata['ray_id'] or '?'}` · "
+            f"acción `{event.metadata['action'] or '?'}`"
+        ),
+        inline=False,
+    )
+    await channel.send(embed=embed)
+
+
+def _log_cloudflare_error(error):
+    global cloudflare_last_error_log
+    now = utcnow()
+    if (
+        cloudflare_last_error_log is None
+        or now - cloudflare_last_error_log >= timedelta(minutes=5)
+    ):
+        print(f"Cloudflare Access API: {error}", file=sys.stderr)
+        cloudflare_last_error_log = now
+
+
+async def _refresh_cloudflare_access(channel, since):
+    try:
+        items = await cloudflare_client.fetch(since)
+    except Exception as error:
+        _log_cloudflare_error(error)
+        return False
+    for item in sorted(items, key=lambda value: value.get("created_at", "")):
+        ingested = _ingest_cloudflare_item(item)
+        if ingested is not None:
+            await _notify_cloudflare_access(channel, *ingested)
+    return True
+
+
+async def _correlate_cloudflare_login(channel, timestamp):
+    """Query Access on demand, then atomically claim the closest event."""
+    if cloudflare_client is None:
+        return None, "unconfigured"
+    if not CLOUDFLARE_ACCESS_APP:
+        return None, "missing_app"
+
+    successful_query = False
+    for delay in (0, 2, 5):
+        if delay:
+            await asyncio.sleep(delay)
+        event = security_events.nearest_cloudflare_access(
+            at=timestamp,
+            max_skew_seconds=CLOUDFLARE_CORRELATION_SECONDS,
+            app_domain=CLOUDFLARE_ACCESS_APP,
+            excluded_ids=cloudflare_claimed,
+        )
+        if event is not None and _claim_cloudflare_event(event):
+            return event, "matched"
+        since = timestamp - timedelta(seconds=CLOUDFLARE_CORRELATION_SECONDS)
+        successful_query = (
+            await _refresh_cloudflare_access(channel, since)
+            or successful_query
+        )
+
+    event = security_events.nearest_cloudflare_access(
+        at=timestamp,
+        max_skew_seconds=CLOUDFLARE_CORRELATION_SECONDS,
+        app_domain=CLOUDFLARE_ACCESS_APP,
+        excluded_ids=cloudflare_claimed,
+    )
+    if event is not None and _claim_cloudflare_event(event):
+        return event, "matched"
+    return None, "not_found" if successful_query else "api_error"
 
 
 def make_bar(value, length=12):
@@ -590,8 +772,17 @@ def get_smart_health():
         return None
     for disk in ["/dev/sda", "/dev/nvme0n1", "/dev/nvme0", "/dev/vda"]:
         if os.path.exists(disk):
-            raw = subprocess.getoutput(f"smartctl -H -A {disk} 2>/dev/null")
-            return {"disk": disk, "output": raw}
+            try:
+                result = subprocess.run(
+                    ["smartctl", "-H", "-A", disk],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return {"disk": disk, "output": "smartctl no disponible"}
+            return {"disk": disk, "output": result.stdout.strip()}
     return None
 
 def get_service_status(service_name):
@@ -699,10 +890,12 @@ async def _process_ssh_login(channel, line):
         return
     user = event["user"]
     origin_ip = event["ip"]
+    timestamp = utcnow()
     cf_event = None
-    if is_loopback(origin_ip) and CLOUDFLARE_ACCESS_APP:
-        cf_event = security_events.latest_cloudflare_access(
-            max_age_seconds=CLOUDFLARE_CORRELATION_SECONDS
+    correlation_status = "direct"
+    if is_loopback(origin_ip):
+        cf_event, correlation_status = await _correlate_cloudflare_login(
+            channel, timestamp
         )
     real_ip = cf_event.ip if cf_event else origin_ip
     country = (
@@ -713,8 +906,10 @@ async def _process_ssh_login(channel, line):
         "ssh_login",
         ip=real_ip,
         user=user,
+        timestamp=timestamp,
         transport_ip=origin_ip,
         cloudflare_ray=cf_event.metadata.get("ray_id") if cf_event else "",
+        cloudflare_correlation=correlation_status,
         country=country.label if country else "",
         country_source=country.source if country else "",
     )
@@ -757,10 +952,8 @@ async def _process_ssh_login(channel, line):
     elif origin["unresolved_proxy"]:
         embed.add_field(
             name="☁️ Cloudflare Access",
-            value=(
-                f"`sshd` recibió `{origin_ip}` desde el proxy local. "
-                "La IP pública, el usuario de Access y el Ray ID no están "
-                "disponibles hasta configurar la API de Access."
+            value=_cloudflare_correlation_note(
+                correlation_status, origin_ip
             ),
             inline=False,
         )
@@ -1565,10 +1758,10 @@ async def _notify_remote_ssh_login(channel, event, timestamp):
     remote_stats_counter["ssh_events"] += 1
     origin_ip = event["ip"]
     cloudflare_event = None
-    if is_loopback(origin_ip) and CLOUDFLARE_ACCESS_APP:
-        cloudflare_event = security_events.latest_cloudflare_access(
-            max_age_seconds=CLOUDFLARE_CORRELATION_SECONDS,
-            now=timestamp,
+    correlation_status = "direct"
+    if is_loopback(origin_ip):
+        cloudflare_event, correlation_status = await _correlate_cloudflare_login(
+            channel, timestamp
         )
     real_ip = cloudflare_event.ip if cloudflare_event else origin_ip
     country = (
@@ -1581,6 +1774,11 @@ async def _notify_remote_ssh_login(channel, event, timestamp):
         user=event.get("user", ""),
         timestamp=timestamp,
         transport_ip=origin_ip,
+        cloudflare_ray=(
+            cloudflare_event.metadata.get("ray_id")
+            if cloudflare_event else ""
+        ),
+        cloudflare_correlation=correlation_status,
         country=country.label if country else "",
         country_source=country.source if country else "",
     )
@@ -1625,10 +1823,8 @@ async def _notify_remote_ssh_login(channel, event, timestamp):
     elif origin["unresolved_proxy"]:
         embed.add_field(
             name="☁️ Cloudflare Access",
-            value=(
-                f"`sshd` recibió `{origin_ip}` desde el proxy local. "
-                "La IP pública, el usuario de Access y el Ray ID no están "
-                "disponibles hasta configurar la API de Access."
+            value=_cloudflare_correlation_note(
+                correlation_status, origin_ip
             ),
             inline=False,
         )
@@ -2032,82 +2228,10 @@ async def _notify_fail2ban_ban(channel, jail, ip):
 @tasks.loop(minutes=1)
 async def watch_cloudflare_access():
     """Poll Access logs: the client public IP is unavailable at an SSH origin."""
-    global cloudflare_since
     channel = bot.get_channel(CHANNEL_ID)
     if not channel or cloudflare_client is None:
         return
-    try:
-        items = await cloudflare_client.fetch(cloudflare_since)
-    except Exception as error:
-        if DEBUG_MODE:
-            print(f"Cloudflare Access watcher: {error}", file=sys.stderr)
-        return
-
-    for item in sorted(items, key=lambda value: value.get("created_at", "")):
-        item_timestamp = parse_timestamp(item.get("created_at"))
-        if item_timestamp > cloudflare_since:
-            cloudflare_since = item_timestamp
-        event_id = cloudflare_event_id(item)
-        if event_id in cloudflare_seen:
-            continue
-        app_domain = str(item.get("app_domain") or "")
-        if CLOUDFLARE_ACCESS_APP and CLOUDFLARE_ACCESS_APP not in app_domain.lower():
-            continue
-        if len(cloudflare_seen_order) == cloudflare_seen_order.maxlen:
-            cloudflare_seen.discard(cloudflare_seen_order.popleft())
-        cloudflare_seen.add(event_id)
-        cloudflare_seen_order.append(event_id)
-
-        created_at = item.get("created_at")
-        access_ip = str(item.get("ip_address") or "")
-        country = country_resolver.resolve(access_ip, cloudflare_item=item)
-        event = security_events.add(
-            "cloudflare_access",
-            ip=access_ip,
-            user=str(item.get("user_email") or ""),
-            timestamp=created_at,
-            allowed=bool(item.get("allowed")),
-            ray_id=str(item.get("ray_id") or ""),
-            app_domain=app_domain,
-            action=str(item.get("action") or ""),
-            country=country.label if country else "",
-            country_source=country.source if country else "",
-        )
-        stats_counter["cloudflare_access"] += 1
-        allowed = event.metadata["allowed"]
-        embed = discord.Embed(
-            title=(
-                "☁️ Cloudflare Access autorizado"
-                if allowed else "🚫 Cloudflare Access denegado"
-            ),
-            color=0x2ecc71 if allowed else 0xe74c3c,
-            timestamp=datetime.now(),
-        )
-        embed.add_field(
-            name="👤 Identidad",
-            value=f"`{event.user or 'desconocida'}`",
-            inline=True,
-        )
-        embed.add_field(
-            name="🌐 IP pública observada",
-            value=f"`{event.ip or 'desconocida'}`",
-            inline=True,
-        )
-        _add_country_field(embed, country)
-        embed.add_field(
-            name="🎯 Aplicación",
-            value=f"`{app_domain or 'desconocida'}`",
-            inline=False,
-        )
-        embed.add_field(
-            name="🔎 Trazabilidad",
-            value=(
-                f"Ray `{event.metadata['ray_id'] or '?'}` · "
-                f"acción `{event.metadata['action'] or '?'}`"
-            ),
-            inline=False,
-        )
-        await channel.send(embed=embed)
+    await _refresh_cloudflare_access(channel, cloudflare_since)
 
 
 def _probe_lines(probes):
