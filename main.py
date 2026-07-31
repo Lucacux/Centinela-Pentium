@@ -13,6 +13,11 @@ import io
 from collections import deque
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import json
+import netdiag
+import procmon
+import alerts
+from alerts import ALARM, CRITICAL, NO_DATA, OK, WARNING, Alarm, AlarmEngine
 from grafana import GrafanaClient, GrafanaError, parse_range
 from fleet_report import render_fleet_pages
 from ip_geolocation import CountryEstimate, CountryResolver
@@ -63,6 +68,17 @@ CLOUDFLARE_CORRELATION_SECONDS = int(
 )
 GEOIP_COUNTRY_DB = os.getenv('GEOIP_COUNTRY_DB', '').strip()
 GEOIP_COUNTRY_LOCALE = os.getenv('GEOIP_COUNTRY_LOCALE', 'es').strip()
+
+# --- DIAGNOSTICO DE RED (ver netdiag.py) ---
+# El Centinela aca solo OBSERVA: diagnostica y reporta. Quien reinicia el ONU es
+# el ISP Uplink Guardian; nosotros lo consultamos de solo lectura.
+SPEEDTEST_ENABLED = os.getenv('SPEEDTEST_ENABLED', 'true').lower() in ('true', '1', 'yes')
+SPEEDTEST_EVERY_H = int(os.getenv('SPEEDTEST_EVERY_HOURS', '6'))
+# Cada corrida consume ~40 MB y tarda ~25s: sin cooldown propio un usuario
+# impaciente puede saturar el enlace que justamente esta tratando de medir.
+SPEEDTEST_COOLDOWN = timedelta(minutes=int(os.getenv('SPEEDTEST_COOLDOWN_MIN', '10')))
+SPEEDTEST_HISTORY = os.getenv('SPEEDTEST_HISTORY_FILE', 'speedtest_history.json')
+SPEEDTEST_HISTORY_MAX = 60
 
 # --- GRAFANA (feature opcional: paneles del dashboard en el bot) ---
 # Todo se descubre en caliente via la API; no se hardcodea ningun dashboard/panel.
@@ -155,22 +171,49 @@ stats_counter = {
     "service_alerts": 0,
     "fail2ban_bans": 0,
     "cloudflare_access": 0,
+    "alerts": 0,
 }
+# Solo para lo que NO pasa por el motor de alarmas (que lleva su propio
+# cooldown por alarma): fuerza bruta SSH y el ritmo del speedtest.
 last_alert_time = {
-    "cpu": datetime.min, "ram": datetime.min, "disk": datetime.min,
-    "swap": datetime.min, "temp": datetime.min, "network": datetime.min,
+    "speedtest": datetime.min,
+    "slow": datetime.min,
 }
 ALERT_COOLDOWN = timedelta(hours=1)
+
+# --- ALARMAS (ver alerts.py) ---
+# Umbral, N de M, severidad y cooldown declarados en un solo lugar. Solo lo
+# marcado como critico atraviesa el modo silencio nocturno.
+#
+# `action` describe que hacer, pero NO se ejecuta: se propone y decidis vos.
+# Nada de esto toca el sistema por su cuenta.
+alarm_engine = AlarmEngine([
+    # 2 de 3 minutos: un pico de compilacion no es una emergencia, tres
+    # minutos sostenidos al 90% si.
+    Alarm("cpu", "🔥 CPU alta", 90, datapoints=2, periods=3, severity=CRITICAL,
+          description="CPU sostenida por encima del 90%.",
+          action="Revisá `!top`; si hay un proceso desbocado, `!restart <servicio>`."),
+    Alarm("ram", "🧠 RAM alta", 90, datapoints=2, periods=3, severity=CRITICAL,
+          description="Memoria por encima del 90%.",
+          action="Revisá `!top`. Con 3.8 GB en el pentium, el candidato suele ser un contenedor sin límite."),
+    # El disco no oscila: si esta al 91% dos muestras seguidas, esta lleno.
+    Alarm("disco", "🚨 Disco crítico", 90, datapoints=2, periods=2, severity=CRITICAL,
+          description="Partición raíz por encima del 90%.",
+          action="`docker system prune` y revisá `/var/log`. Ya pasó de llenar `/var` en la VM Debian."),
+    Alarm("swap", "⚠️ Swap en uso", SWAP_ALERT_PCT, datapoints=3, periods=4, severity=WARNING,
+          description="Uso de swap sostenido: el equipo está paginando.",
+          action="Ver qué proceso creció en `!top` por RAM."),
+    Alarm("temp", "🌡️ Temperatura alta", TEMP_ALERT_C, datapoints=2, periods=3, severity=CRITICAL,
+          unit="°C", description="Sensor por encima del umbral.",
+          action="Revisá ventilación y polvo. Si el sensor desaparece, la alarma pasa a SIN DATOS."),
+])
 last_docker_alert = {}
 docker_heal_attempts = {}
 DOCKER_LOOP_COOLDOWN = timedelta(minutes=30)
 HEAL_TIMEOUT = timedelta(hours=1)
 
-cpu_high_streak = 0
-ram_high_streak = 0
 
 last_service_status = {}
-network_was_down = False
 security_events = EventCorrelator(window_seconds=900)
 fail2ban_banned = {}
 active_ban_notifications = set()
@@ -178,6 +221,13 @@ fail2ban_journal_since = utcnow() - timedelta(minutes=2)
 cloudflare_seen = set()
 cloudflare_seen_order = deque(maxlen=2000)
 cloudflare_since = utcnow() - timedelta(minutes=2)
+# Capa culpable del ultimo corte ("wan", "dns", ...) o None si la red esta sana.
+# Guardar la CAPA y no un bool permite avisar cuando la falla se MUEVE de lugar
+# (p.ej. vuelve la WAN pero ahora lo roto es el DNS): con un bool eso pasaba
+# desapercibido porque "seguia caido".
+network_down_layer = None
+network_down_since = None
+speedtest_running = False
 
 # ==========================================
 # HELPERS VISUALES
@@ -216,6 +266,90 @@ def make_bar(value, length=12):
     else:
         emoji = "🟢"
     return f"{emoji} `{bar}` **{int(pct)}%**"
+
+def _fmt_dur(segundos):
+    if not segundos:
+        return "un momento"
+    m, s = divmod(int(segundos), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m" if h else (f"{m}m {s}s" if m else f"{s}s")
+
+
+def build_alarm_embed(evento, temps=None, swap=None):
+    """Convierte un evento del motor en el embed que se postea.
+
+    Aca vive el "si pasa A, respondemos con B": cada alarma trae su accion
+    sugerida y el contexto que hace falta para decidir. La accion se PROPONE,
+    nunca se ejecuta sola.
+    """
+    alarma = evento["alarm"]
+    valor, estado = evento["value"], evento["to"]
+
+    if estado == OK:
+        embed = discord.Embed(
+            title=f"✅ Normalizado: {alarma.title}",
+            description=f"Volvió a la normalidad tras **{_fmt_dur(evento['duration_s'])}** en alarma.",
+            color=0x2ecc71,
+        )
+        if valor is not None:
+            embed.add_field(name="Valor actual", value=f"{valor:.1f}{alarma.unit}", inline=True)
+        return embed
+
+    if estado == NO_DATA:
+        # No es lo mismo que "todo bien": se dejo de poder medir.
+        return discord.Embed(
+            title=f"❔ Sin datos: {alarma.title}",
+            description=f"{alarma.description}\n\nLa métrica dejó de poder medirse. No es lo mismo que estar en cero.",
+            color=0x95a5a6,
+        )
+
+    reincidencia = evento["kind"] == "reminder"
+    embed = discord.Embed(
+        title=f"{alarma.title}{' (sigue)' if reincidencia else ''}",
+        description=alarma.description,
+        color=0xff0000 if alarma.severity == CRITICAL else 0xe67e22,
+    )
+    if valor is not None:
+        embed.add_field(
+            name="Valor",
+            value=f"**{valor:.1f}{alarma.unit}** (umbral {alarma.threshold}{alarma.unit})\n"
+                  + (make_bar(valor) if alarma.unit == "%" else ""),
+            inline=False,
+        )
+    embed.add_field(
+        name="Criterio",
+        value=f"{alarma.datapoints} de {alarma.periods} muestras en falta · severidad **{alarma.severity}**",
+        inline=False,
+    )
+    if reincidencia and evento["duration_s"]:
+        embed.add_field(name="En alarma desde hace", value=_fmt_dur(evento["duration_s"]), inline=False)
+
+    # Contexto util segun la metrica: para CPU y RAM, quien lo esta causando.
+    # Sale del sampler cacheado, que ya tiene tasas reales medidas en el ultimo
+    # minuto -- antes esto listaba systemd y kthreadd con 0%.
+    if alarma.name in ("cpu", "ram", "swap"):
+        clave = "cpu" if alarma.name == "cpu" else "mem"
+        if procmon.sampler.warm():
+            filas = procmon.format_top(procmon.sampler.top(3, clave), clave)
+            if filas:
+                embed.add_field(name="Top procesos", value=filas, inline=False)
+        else:
+            embed.add_field(
+                name="Top procesos",
+                value="_Todavía sin muestra válida de procesos._",
+                inline=False,
+            )
+    if alarma.name == "temp" and temps:
+        caliente = max(temps, key=temps.get)
+        embed.add_field(name="Sensor más caliente", value=f"`{caliente}` — {temps[caliente]:.0f}°C", inline=False)
+    if alarma.name == "swap" and swap is not None:
+        embed.add_field(name="Swap usado", value=format_bytes(swap.used), inline=True)
+
+    if alarma.action:
+        embed.add_field(name="💡 Sugerencia", value=alarma.action, inline=False)
+    embed.set_footer(text=evento["at"].strftime('%d/%m/%Y %H:%M:%S'))
+    return embed
+
 
 def health_color(score):
     if score >= 80:
@@ -326,19 +460,6 @@ def get_temperatures():
         pass
     return temps
 
-def get_top_processes(n=8, sort_by="cpu"):
-    procs = []
-    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
-        try:
-            info = proc.info
-            if info['cpu_percent'] is not None:
-                procs.append(info)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    key = 'cpu_percent' if sort_by == "cpu" else 'memory_percent'
-    procs.sort(key=lambda p: p.get(key, 0), reverse=True)
-    return procs[:n]
-
 def get_open_ports():
     ports = []
     for conn in psutil.net_connections(kind='inet'):
@@ -384,13 +505,6 @@ def get_smart_health():
             raw = subprocess.getoutput(f"smartctl -H -A {disk} 2>/dev/null")
             return {"disk": disk, "output": raw}
     return None
-
-def check_network():
-    try:
-        result = subprocess.run(["ping", "-c", "1", "-W", "3", "1.1.1.1"], capture_output=True, timeout=5)
-        return result.returncode == 0
-    except Exception:
-        return False
 
 def get_service_status(service_name):
     try:
@@ -661,7 +775,7 @@ async def get_guardian_fleet_image():
 @bot.event
 async def on_ready():
     print(f"Bot Centinela ONLINE: {bot.user}")
-    for task in [collect_history, watch_resources, watch_docker_loops, watch_docker_resources, guardian_report, watch_network]:
+    for task in [collect_history, watch_resources, watch_docker_loops, watch_docker_resources, guardian_report, watch_network, watch_speed]:
         if not task.is_running():
             task.start()
     if BACKUP_PATH and not watch_backups.is_running():
@@ -696,6 +810,10 @@ async def on_ready():
             "**Mantenimiento**\n"
             "`!updates`   Actualizaciones\n"
             "`!backups`   Estado de backups\n\n"
+            "**Red y alarmas**\n"
+            "`!red`       Diagnóstico por capas\n"
+            "`!speedtest` Medición contra baseline\n"
+            "`!alarmas`   Estado de las alarmas\n\n"
             "_Imagenes Docker y CVEs los maneja el Updates-Bot:_\n"
             "_`!docker status` · `!cve host` — de toda la flota._"
         )
@@ -720,11 +838,16 @@ async def on_ready():
 
 @tasks.loop(minutes=1)
 async def collect_history():
-    global cpu_high_streak, ram_high_streak
     cpu = psutil.cpu_percent(interval=0.5)
     ram = psutil.virtual_memory().percent
     disk = psutil.disk_usage('/').percent
     swap = psutil.swap_memory().percent
+
+    # Refresca las tasas por proceso desde el loop que ya corre cada minuto, en
+    # un thread para no frenar el event loop barriendo /proc. Asi las alertas
+    # leen datos calientes sin dormir: la lectura es el promedio del ultimo
+    # minuto, que es justo la ventana de una alerta sostenida.
+    await asyncio.to_thread(procmon.sampler.refresh)
 
     history_time.append(datetime.now())
     history_cpu.append(cpu)
@@ -732,62 +855,33 @@ async def collect_history():
     history_disk.append(disk)
     history_swap.append(swap)
 
-    cpu_high_streak = cpu_high_streak + 1 if cpu > 90 else 0
-    ram_high_streak = ram_high_streak + 1 if ram > 90 else 0
-
 @tasks.loop(minutes=2)
 async def watch_resources():
+    """Evalua las metricas del host contra el motor de alarmas.
+
+    Antes esto eran cinco bloques `if valor > umbral and cooldown` escritos a
+    mano, cada uno con su propia nocion de cuando avisar y ninguno con aviso de
+    recuperacion. Ahora solo se miden las metricas y el motor decide.
+    """
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
-    now = datetime.now()
-    disk = psutil.disk_usage('/').percent
-    swap = psutil.swap_memory()
-
-    if cpu_high_streak >= 3 and (now - last_alert_time["cpu"] > ALERT_COOLDOWN):
-        avg_cpu = sum(list(history_cpu)[-3:]) / 3
-        embed = discord.Embed(title="🔥 CPU CRITICA", description=f"**{cpu_high_streak} min** por encima del 90%.", color=0xe74c3c)
-        embed.add_field(name="Uso promedio", value=make_bar(avg_cpu), inline=False)
-        top = get_top_processes(3, "cpu")
-        if top:
-            embed.add_field(name="Top procesos", value="\n".join(f"`{p['name'][:20]}` — {p['cpu_percent']:.0f}%" for p in top), inline=False)
-        embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
-        await channel.send(embed=embed)
-        last_alert_time["cpu"] = now
-
-    if ram_high_streak >= 2 and (now - last_alert_time["ram"] > ALERT_COOLDOWN):
-        avg_ram = sum(list(history_ram)[-2:]) / 2
-        embed = discord.Embed(title="⚠ RAM ALTA", description=f"**{ram_high_streak} min** por encima del 90%.", color=0xe67e22)
-        embed.add_field(name="Uso promedio", value=make_bar(avg_ram), inline=False)
-        top = get_top_processes(3, "ram")
-        if top:
-            embed.add_field(name="Top procesos", value="\n".join(f"`{p['name'][:20]}` — {p['memory_percent']:.1f}%" for p in top), inline=False)
-        embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
-        await channel.send(embed=embed)
-        last_alert_time["ram"] = now
-
-    if disk > 90 and (now - last_alert_time["disk"] > ALERT_COOLDOWN):
-        embed = discord.Embed(title="🚨 DISCO CRITICO", color=0xff0000)
-        embed.add_field(name="Uso actual", value=make_bar(disk), inline=False)
-        embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
-        await channel.send(embed=embed)
-        last_alert_time["disk"] = now
-
-    if swap.percent > SWAP_ALERT_PCT and (now - last_alert_time["swap"] > ALERT_COOLDOWN):
-        embed = discord.Embed(title="⚠️ SWAP en Uso", description=f"**{swap.percent:.0f}%** ({format_bytes(swap.used)})", color=0xe67e22)
-        embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
-        await channel.send(embed=embed)
-        last_alert_time["swap"] = now
 
     temps = get_temperatures()
-    if temps:
-        max_temp = max(temps.values())
-        if max_temp > TEMP_ALERT_C and (now - last_alert_time["temp"] > ALERT_COOLDOWN):
-            hottest = max(temps, key=temps.get)
-            embed = discord.Embed(title="🌡️ TEMPERATURA CRITICA", description=f"**{hottest}**: **{max_temp:.0f}°C** (umbral: {TEMP_ALERT_C}°C)", color=0xff0000)
-            embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
-            await channel.send(embed=embed)
-            last_alert_time["temp"] = now
+    swap = psutil.swap_memory()
+    metricas = {
+        "cpu": history_cpu[-1] if history_cpu else None,
+        "ram": history_ram[-1] if history_ram else None,
+        "disco": psutil.disk_usage('/').percent,
+        "swap": swap.percent,
+        # None y no 0: un sensor que desaparece no es un equipo frio, y el
+        # motor lo distingue pasando la alarma a INSUFFICIENT_DATA.
+        "temp": max(temps.values()) if temps else None,
+    }
+
+    for evento in alarm_engine.evaluate(metricas):
+        await channel.send(embed=build_alarm_embed(evento, temps=temps, swap=swap))
+        stats_counter["alerts"] = stats_counter.get("alerts", 0) + 1
 
 @tasks.loop(minutes=5)
 async def watch_services():
@@ -808,7 +902,6 @@ async def watch_services():
             embed = discord.Embed(title=f"🟢 Servicio Recuperado: {svc}", color=0x2ecc71)
             await channel.send(embed=embed)
         last_service_status[svc] = status
-
 
 async def _command_output(args, timeout=15):
     """Run a fixed argv command without a shell and return (ok, stdout)."""
@@ -990,20 +1083,72 @@ async def watch_cloudflare_access():
         )
         await channel.send(embed=embed)
 
+
+def _probe_lines(probes):
+    """Las capas como se muestran en Discord, en orden de escalera."""
+    icon = {netdiag.OK: "🟢", netdiag.FAIL: "🔴", netdiag.SKIP: "⚪"}
+    order = {name: i for i, name in enumerate(netdiag.LAYER_ORDER)}
+    rows = sorted(probes, key=lambda p: order.get(p.layer, 99))
+    return "\n".join(
+        f"{icon.get(p.state, '⚪')} `{p.layer:<7}` {p.detail}"
+        + (f" _({p.ms:.0f}ms)_" if p.ms else "")
+        for p in rows
+    )
+
+
 @tasks.loop(minutes=3)
 async def watch_network():
-    global network_was_down
+    """Vigila la red y reporta QUE capa fallo, no solo que 'se fue internet'.
+
+    El loop viejo tenia un agujero: al detectar el corte solo seteaba un flag y
+    no mandaba nada, asi que el unico aviso llegaba cuando la red YA habia
+    vuelto. Ahora avisa en el momento, con la capa culpable.
+    """
+    global network_down_layer, network_down_since
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
-    is_up = await asyncio.to_thread(check_network)
-    if not is_up and not network_was_down:
-        network_was_down = True
-    elif is_up and network_was_down:
-        network_was_down = False
-        embed = discord.Embed(title="🌐 Red Restaurada", description="Conectividad recuperada.", color=0x2ecc71)
-        embed.set_footer(text=datetime.now().strftime('%H:%M:%S'))
+
+    probes, guardian = await asyncio.to_thread(netdiag.run_all_probes)
+    verdict = netdiag.diagnose(probes)
+    now = datetime.now()
+
+    if not verdict["healthy"]:
+        layer = verdict["layer"]
+        # Se avisa al caer y tambien si la falla se MUEVE a otra capa: es un
+        # cambio de diagnostico, no repeticion del mismo aviso.
+        if layer != network_down_layer:
+            network_down_layer = layer
+            network_down_since = network_down_since or now
+            embed = discord.Embed(
+                title=verdict["title"], description=verdict["summary"], color=0xe74c3c,
+            )
+            embed.add_field(name="Capa", value=verdict["detail"], inline=False)
+            embed.add_field(name="Diagnostico por capas", value=_probe_lines(probes), inline=False)
+            if guardian and guardian.get("outage_secs"):
+                embed.add_field(
+                    name="ISP Guardian",
+                    value=f"Corte de **{int(guardian['outage_secs'])}s** en curso · "
+                          f"{guardian.get('reboots_in_window', 0)}/{guardian.get('max_reboots', '?')} reboots en ventana",
+                    inline=False,
+                )
+            embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
+            await channel.send(embed=embed)
+        return
+
+    if network_down_layer:
+        # Recuperacion: se informa cuanto duro y que capa habia fallado.
+        dur = int((now - network_down_since).total_seconds()) if network_down_since else 0
+        embed = discord.Embed(
+            title="🌐 Red Restaurada",
+            description=f"Se recupero la capa **{network_down_layer}** tras **{dur // 60}m {dur % 60}s**.",
+            color=0x2ecc71,
+        )
+        embed.add_field(name="Estado actual", value=_probe_lines(probes), inline=False)
+        embed.set_footer(text=now.strftime('%d/%m/%Y %H:%M:%S'))
         await channel.send(embed=embed)
+        network_down_layer = None
+        network_down_since = None
 
 @tasks.loop(minutes=2)
 async def watch_docker_loops():
@@ -1235,16 +1380,16 @@ async def server_status(ctx):
 
 @bot.command(name='top')
 async def top_processes(ctx):
-    for proc in psutil.process_iter(['cpu_percent']):
-        pass
-    await asyncio.sleep(1)
+    # Bajo demanda se toma una muestra corta y propia: da la foto de AHORA en
+    # vez del promedio del ultimo minuto que usan las alertas. Va en un thread
+    # porque duerme 1s entre las dos lecturas.
+    await asyncio.to_thread(procmon.sampler.sample_now, 1.0)
 
     embed = discord.Embed(title=f"📊 Top Procesos — {SERVER_NAME}", color=0x3498db, timestamp=datetime.now())
     for label, sort in [("🖥 Por CPU", "cpu"), ("🧠 Por RAM", "ram")]:
-        top = get_top_processes(8, sort)
-        key = 'cpu_percent' if sort == "cpu" else 'memory_percent'
-        lines = [f"`{p['name'][:18]:<18}` {p[key]:>5.1f}% `{'█' * int(p[key] / 10)}`" for p in top]
-        embed.add_field(name=label, value="\n".join(lines) or "Sin datos", inline=False)
+        rows = procmon.format_top(procmon.sampler.top(8, sort), "cpu" if sort == "cpu" else "mem")
+        embed.add_field(name=label, value=rows or "Sin datos", inline=False)
+    embed.set_footer(text=f"CPU normalizado sobre {procmon.CPU_COUNT} nucleos")
     await ctx.send(embed=embed)
 
 @bot.command(name='who')
@@ -1450,6 +1595,183 @@ async def check_backups(ctx):
 # ==========================================
 # COMANDO GRAFANA (paneles del dashboard en el bot)
 # ==========================================
+def load_speed_history():
+    """Historial de mediciones. En disco porque la referencia sirve justamente
+    despues de un reinicio del bot: una mediana que se pierde en cada deploy no
+    es una linea base."""
+    try:
+        with open(SPEEDTEST_HISTORY) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_speed_measure(result):
+    hist = load_speed_history()
+    hist.append({
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "down": round(result["down_mbps"], 2),
+        "up": round(result["up_mbps"], 2),
+        "ping": round(result["ping_ms"], 1),
+    })
+    hist = hist[-SPEEDTEST_HISTORY_MAX:]
+    try:
+        with open(SPEEDTEST_HISTORY, "w") as fh:
+            json.dump(hist, fh)
+    except OSError:
+        pass
+    return hist
+
+
+def speed_embed(result, verdict):
+    if result.get("error"):
+        return discord.Embed(title="📉 Speedtest fallo", description=result["error"], color=0xe74c3c)
+    color = 0x2ecc71
+    if verdict and verdict["verdict"] == "slow":
+        color = 0xe74c3c
+    elif verdict and verdict["verdict"] == "degraded":
+        color = 0xe67e22
+    embed = discord.Embed(title=f"📡 Speedtest — {SERVER_NAME}", color=color, timestamp=datetime.now())
+    embed.add_field(name="⬇ Bajada", value=f"**{result['down_mbps']:.1f}** Mbps", inline=True)
+    embed.add_field(name="⬆ Subida", value=f"**{result['up_mbps']:.1f}** Mbps", inline=True)
+    embed.add_field(name="⏱ Ping", value=f"**{result['ping_ms']:.0f}** ms", inline=True)
+    if verdict:
+        embed.add_field(name="Contra tu linea base", value=verdict["msg"], inline=False)
+    # El servidor se muestra siempre: sin saber contra que se midio, el numero
+    # no significa nada (los mas cercanos que ofrece estan a 3400 km).
+    embed.set_footer(text=f"vs {result['server']} · {result['distance_km']:.0f} km · {result['isp']}")
+    return embed
+
+
+async def do_speedtest():
+    """Corre el speedtest fuera del event loop y actualiza la linea base."""
+    global speedtest_running
+    if speedtest_running:
+        return None, None
+    speedtest_running = True
+    try:
+        result = await asyncio.to_thread(netdiag.run_speedtest)
+    finally:
+        speedtest_running = False
+    if result.get("error"):
+        return result, None
+    history = [h["down"] for h in load_speed_history()]
+    verdict = netdiag.evaluate_speed(result, history)
+    save_speed_measure(result)
+    return result, verdict
+
+
+@bot.command(name='alarmas', aliases=['alarms'])
+async def show_alarms(ctx):
+    """Estado de todas las alarmas, como la consola de CloudWatch."""
+    icono = {OK: "🟢", ALARM: "🔴", NO_DATA: "⚪"}
+    embed = discord.Embed(title=f"🚨 Alarmas — {SERVER_NAME}", color=0x3498db, timestamp=datetime.now())
+    en_alarma = [a for a in alarm_engine.snapshot() if a["state"] == ALARM]
+    embed.color = 0xff0000 if en_alarma else 0x2ecc71
+
+    filas = []
+    for a in alarm_engine.snapshot():
+        valor = f"{a['value']:.1f}{a['unit']}" if a["value"] is not None else "sin dato"
+        filas.append(f"{icono.get(a['state'], '⚪')} `{a['name']:<6}` {valor:>10} / umbral {a['threshold']}{a['unit']}")
+    embed.add_field(name="Estado", value="\n".join(filas), inline=False)
+
+    if alerts.QUIET_ENABLED:
+        activo = " (activo ahora)" if alerts.in_quiet_hours() else ""
+        embed.add_field(
+            name="🌙 Modo silencio",
+            value=f"{alerts.QUIET_START:02d}:00–{alerts.QUIET_END:02d}:00 · solo alertas críticas{activo}",
+            inline=False,
+        )
+    embed.set_footer(text="Las acciones se proponen; ninguna se ejecuta sola.")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name='red', aliases=['net', 'diag'])
+async def network_diag(ctx):
+    """Diagnostico de red por capas: enlace, WAN, DNS, HTTP y ONU."""
+    msg = await ctx.send("🔎 Diagnosticando la red por capas...")
+    probes, guardian = await asyncio.to_thread(netdiag.run_all_probes)
+    verdict = netdiag.diagnose(probes)
+
+    embed = discord.Embed(
+        title=verdict["title"],
+        description=verdict["summary"],
+        color=0x2ecc71 if verdict["healthy"] else 0xe74c3c,
+        timestamp=datetime.now(),
+    )
+    embed.add_field(name="Capas", value=_probe_lines(probes), inline=False)
+
+    if guardian:
+        estado = "🟢 OK" if guardian.get("wan_up") else "🔴 caido"
+        linea = [f"WAN {estado} · ONU {'🟢' if guardian.get('onu_up') else '🔴'}"]
+        if guardian.get("outage_secs"):
+            linea.append(f"corte en curso: {int(guardian['outage_secs'])}s")
+        linea.append(f"reboots en ventana: {guardian.get('reboots_in_window', 0)}/{guardian.get('max_reboots', '?')}")
+        embed.add_field(name="ISP Guardian (solo lectura)", value=" · ".join(linea), inline=False)
+
+        # "En verbo pasado": cuando volvio, a que hora se cayo y cuanto duro.
+        cortes = [e for e in (guardian.get("events") or []) if e.get("type") == "wan_up"][-5:]
+        if cortes:
+            embed.add_field(
+                name="Ultimos cortes",
+                value="\n".join(f"`{e.get('iso', '?')}` {e.get('msg', '')}" for e in reversed(cortes)),
+                inline=False,
+            )
+    await msg.delete()
+    await ctx.send(embed=embed)
+
+
+@bot.command(name='speedtest', aliases=['velocidad'])
+async def speedtest_cmd(ctx):
+    """Mide la velocidad real del enlace contra la linea base historica."""
+    if not netdiag.speedtest_available():
+        await ctx.send("⚠️ `speedtest-cli` no esta instalado en este host.")
+        return
+    now = datetime.now()
+    restante = SPEEDTEST_COOLDOWN - (now - last_alert_time["speedtest"])
+    if restante > timedelta(0):
+        await ctx.send(f"⏳ Esperá {int(restante.total_seconds() // 60)}m: cada corrida usa ~40 MB del enlace que estamos midiendo.")
+        return
+    if speedtest_running:
+        await ctx.send("⏳ Ya hay un speedtest en curso.")
+        return
+    last_alert_time["speedtest"] = now
+
+    msg = await ctx.send("📡 Midiendo (~25s)...")
+    result, verdict = await do_speedtest()
+    await msg.delete()
+    await ctx.send(embed=speed_embed(result, verdict))
+
+
+@tasks.loop(hours=SPEEDTEST_EVERY_H)
+async def watch_speed():
+    """Mide periodicamente para construir la linea base.
+
+    Solo avisa cuando el enlace esta MUY por debajo de lo normal: el objetivo es
+    tener referencia historica, no postear un embed cada seis horas.
+    """
+    if not SPEEDTEST_ENABLED or not netdiag.speedtest_available():
+        return
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        return
+    # Medir con la red caida da un numero sin sentido y encima ensucia la mediana.
+    probes, _ = await asyncio.to_thread(netdiag.run_all_probes)
+    if not netdiag.diagnose(probes)["healthy"]:
+        return
+
+    result, verdict = await do_speedtest()
+    if not result or result.get("error") or not verdict:
+        return
+    now = datetime.now()
+    if verdict["verdict"] == "slow" and (now - last_alert_time["slow"] > ALERT_COOLDOWN):
+        last_alert_time["slow"] = now
+        embed = speed_embed(result, verdict)
+        embed.title = "🐌 Internet lento"
+        await channel.send(embed=embed)
+
+
 def _chunk_fields(embed, lines, name="​"):
     """Agrega 'lines' al embed respetando el limite de 1024 char por field."""
     chunk = ""
@@ -1578,6 +1900,7 @@ async def shutdown():
     channel = bot.get_channel(CHANNEL_ID)
     if channel:
         await channel.send(embed=discord.Embed(title="🔴 Sistema Offline", description=f"{SERVER_NAME} apagandose.", color=0xe74c3c))
+    country_resolver.close()
     await bot.close()
 
 def signal_handler(s, f):
