@@ -25,6 +25,8 @@ import aiohttp
 # Imagen de error que Grafana devuelve cuando el plugin de render no esta
 # instalado ("No image renderer available/installed"). Tiene tamano fijo.
 _RENDERER_MISSING_SIZE = (478, 208)
+_RENDER_RETRY_DELAYS = (0, 2, 6)
+_RETRYABLE_RENDER_STATUS = {429, 500, 502, 503, 504}
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 # rangos relativos aceptados como atajo: 15m, 6h, 24h, 7d, 2w...
@@ -86,21 +88,48 @@ class GrafanaClient:
             )
 
     async def _get_bytes(self, path, params=None):
-        try:
-            async with aiohttp.ClientSession(timeout=self._timeout) as s:
-                async with s.get(self.base + path, headers=self._headers, params=params) as r:
-                    body = await r.read()
-                    if r.status != 200:
-                        raise GrafanaError(f"render -> HTTP {r.status}")
-                    ctype = r.headers.get("Content-Type", "")
-                    if "image" not in ctype:
-                        raise GrafanaError(f"el servidor devolvio '{ctype}', no una imagen.")
-                    return body
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            raise GrafanaError(
-                f"no pude conectar a Grafana ({self.base}): {e}. "
-                "Revisá que el bot tenga ruta/firewall hacia el server."
-            )
+        last_connection_error = None
+        total_attempts = len(_RENDER_RETRY_DELAYS)
+        for attempt, delay in enumerate(_RENDER_RETRY_DELAYS, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                async with aiohttp.ClientSession(timeout=self._timeout) as s:
+                    async with s.get(
+                        self.base + path,
+                        headers=self._headers,
+                        params=params,
+                    ) as r:
+                        body = await r.read()
+                        if r.status != 200:
+                            error = GrafanaError(
+                                f"render -> HTTP {r.status} "
+                                f"(intento {attempt}/{total_attempts})"
+                            )
+                            if (
+                                r.status in _RETRYABLE_RENDER_STATUS
+                                and attempt < total_attempts
+                            ):
+                                continue
+                            raise error
+                        ctype = r.headers.get("Content-Type", "")
+                        if "image" not in ctype:
+                            raise GrafanaError(
+                                f"el servidor devolvio '{ctype}', no una imagen."
+                            )
+                        return body
+            except GrafanaError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                last_connection_error = error
+                if attempt < total_attempts:
+                    continue
+
+        raise GrafanaError(
+            f"no pude conectar a Grafana ({self.base}) tras "
+            f"{total_attempts} intentos: {last_connection_error}. "
+            "Revisá que el bot tenga ruta/firewall hacia el server."
+        )
 
     # ---- Descubrimiento (dinamico) ---------------------------------------
     async def health(self):
