@@ -11,6 +11,7 @@
     "truly-api"
   ],
   "backup_path": "/home/luca/Docker/db-truly/borgmatic",
+  "ignored_ssh_key_fingerprints": [],
   "smart_devices": [
     "/dev/sda",
     "/dev/nvme0n1",

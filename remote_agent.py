@@ -35,6 +35,7 @@ def load_config():
         "watched_services": [],
         "allowed_restart": [],
         "backup_path": "",
+        "ignored_ssh_key_fingerprints": [],
         "smart_devices": [
             "/dev/sda",
             "/dev/nvme0n1",
@@ -92,7 +93,12 @@ def temperatures():
                 label = entry.label or f"{chip}_{index}"
                 key = label if label not in result else f"{chip}:{label}"
                 if entry.current is not None:
-                    result[key] = round(float(entry.current), 1)
+                    current = float(entry.current)
+                    # ACPI commonly exposes disconnected channels as -127°C
+                    # or 0°C. Reporting those as real temperatures is worse
+                    # than marking the sensor unavailable.
+                    if 0 < current < 150:
+                        result[key] = round(current, 1)
     except (AttributeError, OSError):
         pass
     return result
@@ -221,9 +227,22 @@ def sessions():
     return rows[:50]
 
 
-def smart_health():
+def smart_health(allow_sudo=True):
     if not shutil.which("smartctl"):
         return {"available": False}
+    if allow_sudo and os.geteuid() != 0 and shutil.which("sudo"):
+        code, output = run([
+            "sudo", "-n", sys.executable, str(Path(__file__).resolve()),
+            "--smart-helper",
+        ], timeout=35)
+        if code == 0:
+            try:
+                payload = json.loads(output)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and payload.get("ok"):
+                payload.pop("ok", None)
+                return payload
     for device in CONFIG.get("smart_devices", []):
         if not os.path.exists(device):
             continue
@@ -382,6 +401,13 @@ def security_events(since_epoch):
         except ValueError:
             continue
         message = str(value.get("MESSAGE", ""))
+        if any(
+            fingerprint and fingerprint in message
+            for fingerprint in CONFIG.get(
+                "ignored_ssh_key_fingerprints", []
+            )
+        ):
+            continue
         if not any(marker in message for marker in (
             "Accepted ",
             "Failed password",
@@ -436,6 +462,16 @@ def dispatch(argv):
     raise ValueError("unsupported operation")
 
 
+def smart_helper_main():
+    if os.geteuid() != 0:
+        payload = {"ok": False, "error": "smart helper requires root"}
+    else:
+        payload = smart_health(allow_sudo=False)
+        payload.setdefault("ok", True)
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return 0 if payload.get("ok") else 1
+
+
 def main():
     original = os.getenv("SSH_ORIGINAL_COMMAND", "")
     try:
@@ -453,4 +489,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--smart-helper"]:
+        sys.exit(smart_helper_main())
     sys.exit(main())

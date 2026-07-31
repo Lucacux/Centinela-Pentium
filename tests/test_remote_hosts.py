@@ -156,6 +156,54 @@ class ForcedAgentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             remote_agent.validate_name("api; shutdown")
 
+    def test_invalid_temperature_channels_are_removed(self):
+        reading = type("Reading", (), {"label": "bad", "current": -127.0})
+        valid = type("Reading", (), {"label": "cpu", "current": 48.5})
+        with patch.object(
+            remote_agent.psutil,
+            "sensors_temperatures",
+            return_value={"chip": [reading, valid]},
+        ):
+            self.assertEqual(remote_agent.temperatures(), {"cpu": 48.5})
+
+    def test_smart_uses_only_the_fixed_privileged_helper(self):
+        helper_payload = json.dumps({
+            "ok": True,
+            "available": True,
+            "device": "/dev/sda",
+            "healthy": True,
+            "output": "PASSED",
+        })
+        with patch.object(
+            remote_agent.os, "geteuid", return_value=1000
+        ), patch.object(
+            remote_agent.shutil, "which", return_value="/usr/bin/tool"
+        ), patch.object(
+            remote_agent, "run", return_value=(0, helper_payload)
+        ) as run:
+            payload = remote_agent.smart_health()
+        self.assertTrue(payload["healthy"])
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:2], ["sudo", "-n"])
+        self.assertEqual(argv[-1], "--smart-helper")
+
+    def test_security_ignores_the_collector_key_fingerprint(self):
+        line = json.dumps({
+            "MESSAGE": (
+                "Accepted publickey for luca from 192.168.2.10 port 22 "
+                "ssh2: ED25519 SHA256:collector"
+            ),
+            "__REALTIME_TIMESTAMP": "1000000",
+        })
+        with patch.object(
+            remote_agent,
+            "CONFIG",
+            {"ignored_ssh_key_fingerprints": ["SHA256:collector"]},
+        ), patch.object(
+            remote_agent, "run", return_value=(0, line)
+        ):
+            self.assertEqual(remote_agent.security_events(1)["events"], [])
+
     def test_main_always_returns_one_json_object(self):
         with patch.dict(
             remote_agent.os.environ,
