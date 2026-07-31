@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from security_events import (
     EventCorrelator,
+    classify_ssh_origin,
     cloudflare_event_id,
     is_loopback,
     parse_fail2ban_banned,
@@ -62,6 +63,34 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(is_loopback("127.0.0.1"))
         self.assertTrue(is_loopback("::1"))
         self.assertFalse(is_loopback("192.168.1.10"))
+
+    def test_uncorrelated_loopback_is_reported_as_proxy_not_external(self):
+        origin = classify_ssh_origin(
+            "::1", "::1", ["192.168.", "10.", "172."], correlated=False
+        )
+        self.assertTrue(origin["unresolved_proxy"])
+        self.assertFalse(origin["is_local"])
+        self.assertIn("Proxy local", origin["label"])
+
+    def test_correlated_proxy_classifies_the_effective_public_ip(self):
+        origin = classify_ssh_origin(
+            "::1",
+            "203.0.113.8",
+            ["192.168.", "10.", "172."],
+            correlated=True,
+        )
+        self.assertFalse(origin["unresolved_proxy"])
+        self.assertFalse(origin["is_local"])
+        self.assertEqual(origin["label"], "⚠️ IP externa")
+
+    def test_direct_lan_login_remains_local(self):
+        origin = classify_ssh_origin(
+            "192.168.2.10",
+            "192.168.2.10",
+            ["192.168.", "10.", "172."],
+        )
+        self.assertTrue(origin["is_local"])
+        self.assertEqual(origin["label"], "Red local")
 
     def test_cloudflare_fallback_id_is_stable(self):
         item = {

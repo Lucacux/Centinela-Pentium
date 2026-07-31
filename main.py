@@ -25,6 +25,7 @@ from remote_hosts import RemoteHostClient, RemoteHostConfig, RemoteHostError
 from security_events import (
     CloudflareAccessClient,
     EventCorrelator,
+    classify_ssh_origin,
     cloudflare_event_id,
     is_loopback,
     parse_timestamp,
@@ -717,10 +718,19 @@ async def _process_ssh_login(channel, line):
         country=country.label if country else "",
         country_source=country.source if country else "",
     )
-    is_local = any(real_ip.startswith(s) for s in SAFE_SUBNETS)
+    origin = classify_ssh_origin(
+        origin_ip,
+        real_ip,
+        SAFE_SUBNETS,
+        correlated=cf_event is not None,
+    )
     embed = discord.Embed(
         title="🔑 Nuevo Login SSH",
-        color=0x2ecc71 if is_local else 0xe67e22,
+        color=(
+            0xf1c40f
+            if origin["unresolved_proxy"]
+            else (0x2ecc71 if origin["is_local"] else 0xe67e22)
+        ),
     )
     embed.add_field(name="👤 Usuario", value=f"`{user}`", inline=True)
     embed.add_field(
@@ -730,7 +740,7 @@ async def _process_ssh_login(channel, line):
     )
     embed.add_field(
         name="🏠 Origen",
-        value="Red local" if is_local else "⚠️ IP externa",
+        value=origin["label"],
         inline=True,
     )
     if cf_event:
@@ -741,6 +751,16 @@ async def _process_ssh_login(channel, line):
                 f"Ray `{cf_event.metadata.get('ray_id') or '?'}`\n"
                 f"Correlación temporal ({CLOUDFLARE_CORRELATION_SECONDS}s); "
                 f"sshd vio `{origin_ip}`."
+            ),
+            inline=False,
+        )
+    elif origin["unresolved_proxy"]:
+        embed.add_field(
+            name="☁️ Cloudflare Access",
+            value=(
+                f"`sshd` recibió `{origin_ip}` desde el proxy local. "
+                "La IP pública, el usuario de Access y el Ray ID no están "
+                "disponibles hasta configurar la API de Access."
             ),
             inline=False,
         )
@@ -1564,10 +1584,19 @@ async def _notify_remote_ssh_login(channel, event, timestamp):
         country=country.label if country else "",
         country_source=country.source if country else "",
     )
-    is_local = any(real_ip.startswith(subnet) for subnet in SAFE_SUBNETS)
+    origin = classify_ssh_origin(
+        origin_ip,
+        real_ip,
+        SAFE_SUBNETS,
+        correlated=cloudflare_event is not None,
+    )
     embed = _remote_embed(
         f"🔑 Nuevo Login SSH — {_remote_name()}",
-        color=0x2ecc71 if is_local else 0xe67e22,
+        color=(
+            0xf1c40f
+            if origin["unresolved_proxy"]
+            else (0x2ecc71 if origin["is_local"] else 0xe67e22)
+        ),
     )
     embed.add_field(
         name="👤 Usuario", value=f"`{event.get('user', '?')}`", inline=True
@@ -1579,7 +1608,7 @@ async def _notify_remote_ssh_login(channel, event, timestamp):
     )
     embed.add_field(
         name="🏠 Origen",
-        value="Red local" if is_local else "⚠️ IP externa",
+        value=origin["label"],
         inline=True,
     )
     if cloudflare_event:
@@ -1590,6 +1619,16 @@ async def _notify_remote_ssh_login(channel, event, timestamp):
                 f"Ray `{cloudflare_event.metadata.get('ray_id') or '?'}`\n"
                 "Correlación temporal; sshd vio "
                 f"`{origin_ip}`."
+            ),
+            inline=False,
+        )
+    elif origin["unresolved_proxy"]:
+        embed.add_field(
+            name="☁️ Cloudflare Access",
+            value=(
+                f"`sshd` recibió `{origin_ip}` desde el proxy local. "
+                "La IP pública, el usuario de Access y el Ray ID no están "
+                "disponibles hasta configurar la API de Access."
             ),
             inline=False,
         )
