@@ -180,6 +180,62 @@ the one-minute loop, so each reading is a true one-minute average and alerts rea
 warm data without sleeping or blocking the event loop. CPU is normalised by core
 count (psutil reports up to `100 * ncores`, i.e. 200% on the E5400).
 
+**On the remote node** the same guarantee needs a different mechanism: the agent
+is a one-shot process per SSH connection, so every `cpu_percent()` there would be
+a first call and return `0.0`. It keeps the cumulative CPU times of the previous
+poll in a small state file under `/run` and reports the delta, which makes each
+reading a true average over the polling interval without sleeping inside the
+agent. The top consumers travel *inside* `snapshot`, not as a second request
+after an alarm fires — the culprit has to be the one measured during the breach,
+not whatever the machine is doing once it has calmed down. Processes owned by a
+container are reported by container name rather than by `python3`.
+
+### 🔐 SSH key identity
+
+sshd writes the fingerprint of the accepted key on every login at `LogLevel INFO`
+(`Accepted publickey for luca from 192.168.2.40 port 55160 ssh2: ED25519
+SHA256:...`); `VERBOSE` is not required. That fingerprint is the only thing in
+the log that separates two automations sharing one Unix account — the user and
+the source IP are identical, the key is not.
+
+Fingerprints are resolved to names through the `authorized_keys` of the node:
+the agent publishes `ssh-keygen -lf` output (fingerprints and comments only, no
+key material), and `SSH_KEY_LABELS` overrides the comment where it is not
+descriptive enough.
+
+Two failure modes are kept distinct on purpose. A fingerprint missing from a
+keyring the bot *could* read means sshd accepted a key nobody can account for,
+and that is a real alert. A fingerprint whose keyring the bot could *not* read
+(`/root/.ssh/authorized_keys` is mode 600) is reported as unverifiable instead —
+claiming "unrecognized key" on every nightly deploy would train the alert to be
+ignored.
+
+### 🕵️ Anomalous logins
+
+`ssh_baseline.py` keeps a persistent profile per `(node, fingerprint, user)`:
+usual source subnet, hour histogram and auth method. The in-memory correlator
+only spans 900 seconds, which is enough to tie a fail2ban ban to the failures
+that caused it but cannot answer "has this key ever logged in before".
+
+Signals, strongest first: unknown fingerprint · password auth on a keys-only
+host · key authorized for one account used on another · new source subnet (with
+an external IP outranking a LAN one) · login outside the key's usual schedule.
+
+The schedule signal only fires for keys that *have* a schedule — a deploy
+controller that always runs at 20:50 spans one hour bucket, an interactive key
+spans many and is never flagged for the hour. Profiles younger than five logins
+produce no anomalies at all: "I have never seen this" means nothing without
+history behind it.
+
+### ⚠️ Failed logins
+
+Below the brute-force threshold, failures are now reported individually with a
+per-IP cooldown. sshd distinguishes `Invalid user` (the account does not exist —
+generic Internet scanning, reported grey) from a failure against a real account
+(someone knows who to aim at, reported orange). Account enumeration produces no
+`Failed` line at all, so `Invalid user` and `[preauth]` disconnects are collected
+too.
+
 ## 🧰 Stack
 
 - Python 3.12
@@ -209,6 +265,17 @@ writable state to `/var/lib/centinela` and any constrained remote-agent key to
 `/etc/centinela`. The account needs `adm` to read SSH/journal events and,
 currently, `docker` for container inspection and explicitly requested
 restarts. It must not belong to `sudo` or `lxd`.
+
+Because `ProtectHome=yes` empties `/home` for the service, the `authorized_keys`
+that feed the fingerprint-to-identity map have to be re-exposed one file at a
+time through the `BindReadOnlyPaths=` lines in the drop-in, matching
+`SSH_KEY_DIRECTORY_FILES`. These are public keys and the fingerprint already
+reaches the journal on every login; what is not granted is the `.ssh` directory
+itself. `BindReadOnlyPaths` only makes the file visible — Unix permissions still
+apply, so a root-owned `authorized_keys` also needs
+`setfacl -m u:centinela:r /root/.ssh/authorized_keys` to be readable. Without
+it the bot degrades honestly and reports root logins as unverifiable rather
+than unrecognized.
 
 The drop-in makes the OS, home directories, kernel interfaces and namespaces
 read-only or inaccessible, removes every process capability and enables
@@ -246,6 +313,11 @@ See [`.env.example`](./.env.example) for the full list:
 | `WATCHED_SERVICES` / `MANAGED_SERVICES` | systemd services under supervision |
 | `ALLOWED_RESTART` | Services the bot is allowed to restart |
 | `SSH_FAIL_THRESHOLD` / `SSH_FAIL_WINDOW` | Threshold and window for brute-force detection |
+| `SSH_FAIL_NOTIFY_ENABLED` / `SSH_FAIL_NOTIFY_COOLDOWN_MIN` | Report failures *below* the brute-force threshold, rate-limited per IP |
+| `SSH_KEY_DIRECTORY_FILES` | `authorized_keys` to read as `user:/path`; needs a matching `BindReadOnlyPaths` under the hardening drop-in |
+| `SSH_KEY_LABELS` / `REMOTE_ARCH_SSH_KEY_LABELS` | `FINGERPRINT=Name` overrides, for when the key comment is not descriptive |
+| `SSH_KEY_REFRESH_MINUTES` | How often the key directories are re-read, so a new key does not need a bot restart |
+| `SSH_ANOMALY_ENABLED` / `SSH_BASELINE_PATH` | Anomalous-login detection and where its persistent profiles live |
 | `FAIL2BAN_ENABLED` | Notify new bans (client status with journald fallback) |
 | `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_ACCESS_TOKEN` | Optional Access authentication logs; use an account-scoped token with only `Access: Audit Logs Read` |
 | `CLOUDFLARE_ACCESS_APP` / `CLOUDFLARE_CORRELATION_SECONDS` | Exact Access hostname (optionally URL/path) and maximum clock/time skew used for SSH correlation |

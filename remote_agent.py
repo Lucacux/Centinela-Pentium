@@ -7,10 +7,12 @@ are never evaluated.
 """
 
 from datetime import datetime
+import getpass
 import glob
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shlex
 import shutil
@@ -36,6 +38,11 @@ def load_config():
         "allowed_restart": [],
         "backup_path": "",
         "ignored_ssh_key_fingerprints": [],
+        # Accounts whose authorized_keys are worth publishing to the central
+        # bot so it can name the key behind each login.  Root is included
+        # because deploy controllers land there; it is skipped silently when
+        # the agent cannot read it.
+        "key_directory_users": ["root"],
         "smart_devices": [
             "/dev/sda",
             "/dev/nvme0n1",
@@ -124,6 +131,171 @@ def network_up():
     return code == 0
 
 
+def _state_path():
+    """Where the CPU accounting between polls lives.
+
+    ``/run`` is tmpfs: the state dies with the host, which is correct, since a
+    CPU delta across a reboot is meaningless.  A user-owned fallback keeps the
+    agent working when ``/run`` is not writable by an unprivileged account.
+    """
+    for candidate in (
+        os.getenv("CENTINELA_AGENT_STATE"),
+        f"/run/user/{os.getuid()}/centinela-agent",
+        "/run/centinela-agent",
+        os.path.join(
+            os.getenv("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+            "centinela-agent",
+        ),
+    ):
+        if not candidate:
+            continue
+        try:
+            os.makedirs(candidate, mode=0o700, exist_ok=True)
+            path = os.path.join(candidate, "proc-state.json")
+            with open(path, "a", encoding="utf-8"):
+                pass
+            return path
+        except OSError:
+            continue
+    return ""
+
+
+def _read_state(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_state(path, payload):
+    # Atomic replace: a snapshot interrupted mid-write must not leave behind a
+    # truncated file that poisons every later delta.
+    temporary = f"{path}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
+_CGROUP_ID_RE = re.compile(r"(?:docker[-/]|cri-containerd-|libpod-)([0-9a-f]{12,64})")
+
+
+def _container_id(pid):
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as handle:
+            content = handle.read()
+    except OSError:
+        return ""
+    match = _CGROUP_ID_RE.search(content)
+    return match.group(1)[:12] if match else ""
+
+
+def _container_names(ids):
+    """Resolve short container IDs to names, with one docker call at most."""
+    if not ids or not shutil.which("docker"):
+        return {}
+    code, output = run(
+        ["docker", "ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}"],
+        timeout=10,
+    )
+    if code != 0:
+        return {}
+    names = {}
+    for line in output.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            names[parts[0][:12]] = parts[1].strip()
+    return {key: names[key] for key in ids if key in names}
+
+
+def process_attribution(limit=5):
+    """Top CPU/RAM consumers, measured against the previous snapshot.
+
+    This exists because the alert that says "CPU at 98%" is useless without a
+    name next to it, and because the agent is a one-shot process: every
+    ``cpu_percent()`` here would be a first call and return 0.0, which is the
+    trap already documented in ``procmon.py`` on the local side.  Persisting
+    the cumulative CPU times between polls turns each reading into a true
+    average over the polling interval -- the same window the alarms evaluate --
+    without sleeping inside the agent.
+    """
+    path = _state_path()
+    previous = _read_state(path) if path else {}
+    previous_at = float(previous.get("at") or 0.0)
+    previous_procs = previous.get("procs") or {}
+    now = time.time()
+    elapsed = now - previous_at if previous_at else 0.0
+
+    current = {}
+    rows = []
+    cpu_count = psutil.cpu_count() or 1
+    for proc in psutil.process_iter(["pid", "name", "create_time"]):
+        try:
+            with proc.oneshot():
+                times = proc.cpu_times()
+                busy = float(times.user + times.system)
+                created = float(proc.info.get("create_time") or 0.0)
+                name = proc.info.get("name") or "?"
+                memory = float(proc.memory_percent() or 0.0)
+        except (psutil.NoSuchProcess, psutil.AccessDenied,
+                psutil.ZombieProcess, OSError):
+            continue
+        key = str(proc.pid)
+        current[key] = [round(busy, 3), round(created, 3)]
+        cpu = None
+        earlier = previous_procs.get(key)
+        # create_time guards against PID reuse: a recycled PID would otherwise
+        # inherit the CPU counter of the process that died holding it and be
+        # reported as pinning the machine.
+        if (
+            elapsed > 0
+            and isinstance(earlier, list)
+            and len(earlier) == 2
+            and abs(float(earlier[1]) - created) < 1.0
+        ):
+            delta = busy - float(earlier[0])
+            if delta >= 0:
+                cpu = 100.0 * delta / elapsed / cpu_count
+        rows.append({
+            "pid": proc.pid,
+            "name": name,
+            "cpu": round(cpu, 1) if cpu is not None else None,
+            "ram": round(memory, 1),
+        })
+
+    if path:
+        _write_state(path, {"at": round(now, 3), "procs": current})
+
+    measured = [row for row in rows if row["cpu"] is not None]
+    top_cpu = sorted(measured, key=lambda row: row["cpu"], reverse=True)[:limit]
+    top_ram = sorted(rows, key=lambda row: row["ram"], reverse=True)[:limit]
+
+    highlighted = {row["pid"] for row in top_cpu} | {row["pid"] for row in top_ram}
+    containers = {pid: _container_id(pid) for pid in highlighted}
+    names = _container_names({value for value in containers.values() if value})
+    for row in top_cpu + top_ram:
+        identifier = containers.get(row["pid"], "")
+        if identifier:
+            row["container"] = names.get(identifier) or identifier
+
+    return {
+        # False on the first poll after a reboot: no previous sample to diff
+        # against, so a table of nulls must not be published as a measurement.
+        "warm": bool(measured),
+        "window_s": round(elapsed, 1),
+        "cpu": top_cpu,
+        "ram": top_ram,
+    }
+
+
 def snapshot():
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
@@ -151,6 +323,11 @@ def snapshot():
         "network_up": network_up(),
         "temperatures": temperatures(),
         "services": service_states(),
+        # Folded into the snapshot rather than fetched when an alarm fires:
+        # the culprit has to be the one measured DURING the breach, and a
+        # second SSH round-trip afterwards samples a machine that may have
+        # already calmed down.
+        "processes": process_attribution(),
         "timestamp": datetime.now().astimezone().isoformat(),
     }
 
@@ -182,6 +359,60 @@ def top_processes(limit=8):
         "cpu": sorted(rows, key=lambda item: item["cpu"], reverse=True)[:limit],
         "ram": sorted(rows, key=lambda item: item["ram"], reverse=True)[:limit],
     }
+
+
+def _home_directory(user):
+    try:
+        return pwd.getpwnam(user).pw_dir
+    except KeyError:
+        return "/root" if user == "root" else f"/home/{user}"
+
+
+def _fingerprints_for(path):
+    """Fingerprints of one authorized_keys file, or ``None`` if unreadable.
+
+    ``None`` and ``[]`` mean different things and the caller depends on the
+    difference: an empty list is "this account authorizes nothing", while
+    ``None`` is "we could not look", which must not be reported as an
+    unrecognized key.
+    """
+    if not os.path.isfile(path):
+        return None
+    if not os.access(path, os.R_OK):
+        return None
+    code, output = run(["ssh-keygen", "-lf", path], timeout=10)
+    if code != 0:
+        return None
+    return output
+
+
+def key_directory():
+    """Publish the fingerprint -> comment map behind every accepted login.
+
+    Only fingerprints and comments leave the host; no public key material and
+    no private key ever does.  A fingerprint is not a secret -- sshd already
+    writes it to the journal on every accepted connection.
+    """
+    users = [getpass.getuser()]
+    for user in CONFIG.get("key_directory_users", []):
+        if NAME_RE.fullmatch(str(user)) and str(user) not in users:
+            users.append(str(user))
+    entries = []
+    covered = []
+    for user in users:
+        home = _home_directory(user)
+        found = False
+        for name in ("authorized_keys", "authorized_keys2"):
+            output = _fingerprints_for(os.path.join(home, ".ssh", name))
+            if output is None:
+                continue
+            found = True
+            for line in output.splitlines():
+                if line.strip():
+                    entries.append({"user": user, "line": line.rstrip()})
+        if found:
+            covered.append(user)
+    return {"entries": entries[:500], "covered_users": covered}
 
 
 def open_ports():
@@ -386,6 +617,10 @@ def security_events(since_epoch):
     since_epoch = max(now - 86_400, min(int(since_epoch), now))
     code, output = run([
         "journalctl",
+        # Debian names the unit `ssh` and Arch names it `sshd`. Asking for both
+        # costs nothing and stops the collector from silently returning zero
+        # events the day a Debian node joins the fleet.
+        "-u", "ssh",
         "-u", "sshd",
         "-u", "fail2ban",
         "--since", f"@{since_epoch}",
@@ -410,8 +645,14 @@ def security_events(since_epoch):
             continue
         if not any(marker in message for marker in (
             "Accepted ",
-            "Failed password",
+            # "Failed password" alone missed every publickey rejection and
+            # every username probe: sshd logs "Invalid user X" BEFORE any
+            # credential is offered, so account enumeration produced no
+            # "Failed" line at all and was invisible to the bot.
+            "Failed ",
+            "Invalid user",
             "authentication failure",
+            "[preauth]",
             "] Ban ",
             "] Unban ",
         )):
@@ -443,6 +684,8 @@ def dispatch(argv):
         return {"ports": open_ports()}
     if action == "sessions":
         return {"sessions": sessions()}
+    if action == "keys":
+        return key_directory()
     if action == "smart":
         return smart_health()
     if action == "docker":
