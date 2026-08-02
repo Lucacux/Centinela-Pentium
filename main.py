@@ -25,10 +25,12 @@ from remote_hosts import RemoteHostClient, RemoteHostConfig, RemoteHostError
 from security_events import (
     CloudflareAccessClient,
     EventCorrelator,
+    SshKeyDirectory,
     access_app_matches,
     classify_ssh_origin,
     cloudflare_event_id,
     is_loopback,
+    parse_ssh_keygen_fingerprints,
     parse_timestamp,
     parse_fail2ban_banned,
     parse_fail2ban_jails,
@@ -36,6 +38,7 @@ from security_events import (
     parse_ssh_line,
     utcnow,
 )
+from ssh_baseline import CRITICAL as ANOMALY_CRITICAL, LoginBaseline
 from docker_ops import (
     docker_cmd,
     get_docker_stats,
@@ -79,6 +82,69 @@ REMOTE_ARCH_SSH_FAIL_THRESHOLD = int(
 REMOTE_ARCH_SSH_FAIL_WINDOW = int(
     os.getenv('REMOTE_ARCH_SSH_FAIL_WINDOW', str(SSH_FAIL_WINDOW))
 )
+
+# --- IDENTIDAD DE CLAVES SSH ---
+# sshd escribe el fingerprint de la clave aceptada en cada login (LogLevel
+# INFO, sin necesidad de VERBOSE). Traducirlo a un nombre es lo que convierte
+# "entro luca desde 192.168.2.40" en "entro el bot de Ansible": el usuario Unix
+# y la IP son iguales para varias automatizaciones, el fingerprint no.
+#
+# Los authorized_keys locales se listan explicitamente porque el servicio corre
+# con ProtectHome=yes; cada archivo necesita su BindReadOnlyPaths en el
+# drop-in de hardening (ver deploy/discord-bot-hardening.conf).
+def _parse_key_files(raw):
+    """``usuario:/ruta`` o ``/ruta`` (el usuario se deduce del directorio)."""
+    entries = []
+    for item in str(raw or '').split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if ':' in item and not item.startswith('/'):
+            user, _, path = item.partition(':')
+        else:
+            path = item
+            parts = os.path.normpath(path).split(os.sep)
+            user = parts[2] if len(parts) > 3 and parts[1] == 'home' else (
+                'root' if path.startswith('/root/') else ''
+            )
+        entries.append((user.strip(), path.strip()))
+    return entries
+
+
+def _parse_key_labels(raw):
+    """``SHA256:xxx=Ansible,SHA256:yyy=Dokploy``."""
+    labels = {}
+    for item in str(raw or '').split(','):
+        fingerprint, _, label = item.partition('=')
+        if fingerprint.strip() and label.strip():
+            labels[fingerprint.strip()] = label.strip()
+    return labels
+
+
+SSH_KEY_FILES = _parse_key_files(os.getenv('SSH_KEY_DIRECTORY_FILES', ''))
+SSH_KEY_LABELS = _parse_key_labels(os.getenv('SSH_KEY_LABELS', ''))
+REMOTE_SSH_KEY_LABELS = _parse_key_labels(
+    os.getenv('REMOTE_ARCH_SSH_KEY_LABELS', '')
+)
+SSH_KEY_REFRESH_MIN = max(5, int(os.getenv('SSH_KEY_REFRESH_MINUTES', '30')))
+# Cada cuanto se puede repetir el aviso de fallos para una misma IP. Sin esto
+# un escaneo de 500 intentos son 500 embeds.
+SSH_FAIL_NOTIFY_COOLDOWN = timedelta(
+    minutes=max(1, int(os.getenv('SSH_FAIL_NOTIFY_COOLDOWN_MIN', '15')))
+)
+SSH_FAIL_NOTIFY_ENABLED = os.getenv(
+    'SSH_FAIL_NOTIFY_ENABLED', 'true'
+).lower() in ('true', '1', 'yes')
+_STATE_DIR = (
+    os.getenv('STATE_DIRECTORY', '').split(':')[0]
+    or os.path.expanduser('~/.local/state/centinela')
+)
+SSH_BASELINE_PATH = os.getenv(
+    'SSH_BASELINE_PATH', os.path.join(_STATE_DIR, 'ssh-baseline.json')
+)
+SSH_ANOMALY_ENABLED = os.getenv(
+    'SSH_ANOMALY_ENABLED', 'true'
+).lower() in ('true', '1', 'yes')
 
 # --- DIAGNOSTICO DE RED (ver netdiag.py) ---
 # El Centinela aca solo OBSERVA: diagnostica y reporta. Quien reinicia el ONU es
@@ -138,6 +204,9 @@ remote_arch_config = RemoteHostConfig.from_env()
 remote_arch = (
     RemoteHostClient(remote_arch_config) if remote_arch_config else None
 )
+local_key_directory = SshKeyDirectory(SSH_KEY_LABELS)
+remote_key_directory = SshKeyDirectory(REMOTE_SSH_KEY_LABELS)
+login_baseline = LoginBaseline(SSH_BASELINE_PATH if SSH_ANOMALY_ENABLED else '')
 
 if not TOKEN or not CHANNEL_ID_ENV:
     print("ERROR: Falta DISCORD_TOKEN o DISCORD_CHANNEL_ID en .env")
@@ -198,6 +267,9 @@ last_alert_time = {
     "speedtest": datetime.min,
     "slow": datetime.min,
 }
+# Ultimo aviso individual de fallo por IP (local y remoto en el mismo dict,
+# con prefijo de nodo en la clave).
+ssh_fail_notified = {}
 ALERT_COOLDOWN = timedelta(hours=1)
 
 # --- ALARMAS (ver alerts.py) ---
@@ -829,6 +901,186 @@ def get_borg_last_backup(repo_path):
     return mtime, newest
 
 # ==========================================
+# IDENTIDAD DE CLAVES SSH
+# ==========================================
+def _read_local_key_directory():
+    """Fingerprints de los authorized_keys declarados en el entorno.
+
+    Se invoca `ssh-keygen -lf` en vez de parsear el archivo a mano porque
+    calcular el fingerprint implica decodificar el blob base64 y hashearlo con
+    el mismo formato que usa sshd; delegarlo evita que un formato de clave
+    nuevo (o un `cert-authority`) devuelva un hash que no matchea el del log.
+    """
+    entries = []
+    covered = []
+    for user, path in SSH_KEY_FILES:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            result = subprocess.run(
+                ["ssh-keygen", "-lf", path],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            continue
+        for entry in parse_ssh_keygen_fingerprints(result.stdout):
+            entry["user"] = user
+            entries.append(entry)
+        if user:
+            covered.append(user)
+    return entries, covered
+
+
+def _load_remote_key_entries(payload):
+    """Convierte la respuesta cruda de la accion `keys` del agente."""
+    entries = []
+    for item in (payload or {}).get("entries") or []:
+        if not isinstance(item, dict):
+            continue
+        for entry in parse_ssh_keygen_fingerprints(item.get("line", "")):
+            entry["user"] = str(item.get("user") or "")
+            entries.append(entry)
+    return entries, [
+        str(user) for user in (payload or {}).get("covered_users") or []
+    ]
+
+
+def _key_identity_field(directory, event):
+    """Campo 'Clave' del embed: quien es, no solo que hash uso.
+
+    Devuelve ``(texto, reconocida)``. El fingerprint completo nunca entra al
+    embed: 12 caracteres alcanzan para distinguir las claves de una flota y
+    mantienen el mensaje legible en el celular.
+    """
+    fingerprint = str(event.get("fingerprint") or "")
+    method = str(event.get("method") or "")
+    if not fingerprint:
+        if method and method != "publickey":
+            return f"Sin clave · autenticacion `{method}`", False
+        return "sshd no registro el fingerprint", False
+    label, known = directory.describe(fingerprint)
+    short = directory.short(fingerprint)
+    key_type = str(event.get("key_type") or "").upper()
+    suffix = f" · `{key_type}` `…{short}`" if key_type else f" · `…{short}`"
+    if known:
+        return f"**{label}**{suffix}", True
+    return f"⚠️ **Clave no reconocida**{suffix}", False
+
+
+def _anomaly_field(verdict):
+    if not verdict or not verdict.reasons:
+        return None
+    return "\n".join(f"• {reason['text']}" for reason in verdict.reasons)
+
+
+def _assess_login(node, event, directory, timestamp):
+    """Evalua contra la linea base y luego incorpora el login al perfil.
+
+    El orden importa: `assess` primero, `observe` despues. Al reves, todo
+    login seria conocido por construccion y la deteccion no serviria de nada.
+    """
+    if not SSH_ANOMALY_ENABLED:
+        return None
+    if not login_baseline.loaded:
+        login_baseline.load()
+    verdict = login_baseline.assess(node, event, directory, now=timestamp)
+    login_baseline.observe(node, event, now=timestamp)
+    login_baseline.prune(now=timestamp)
+    if not login_baseline.save() and DEBUG_MODE:
+        print(
+            f"No se pudo persistir la linea base en {SSH_BASELINE_PATH}",
+            file=sys.stderr,
+        )
+    return verdict
+
+
+def _build_ssh_fail_embed(event, summary, *, node="", title_prefix=""):
+    """Embed de un intento fallido, ya agregado por IP.
+
+    Un fallo suelto no es una alerta y tampoco es ruido: la diferencia esta en
+    contra QUE cuenta se intento. sshd distingue explicitamente "invalid user"
+    (la cuenta no existe: escaneo generico de Internet) de un fallo contra una
+    cuenta real, que significa que alguien sabe a quien apuntarle. Solo el
+    segundo caso merece color rojo.
+    """
+    ip = event.get("ip") or "desconocida"
+    user = event.get("user") or "?"
+    invalid = bool(event.get("invalid_user"))
+    external = not any(
+        str(ip).startswith(prefix) for prefix in SAFE_SUBNETS if prefix
+    ) and not is_loopback(ip)
+    serious = not invalid
+    embed = discord.Embed(
+        title=(
+            f"{title_prefix}⚠️ Intento de login fallido"
+            if serious
+            else f"{title_prefix}👣 Sondeo SSH rechazado"
+        ),
+        description=(
+            f"Cuenta **inexistente** `{user}`: patron de escaneo automatico."
+            if invalid
+            else f"Fallo la autenticacion de la cuenta real `{user}`."
+        ),
+        color=0xe67e22 if serious else 0x95a5a6,
+    )
+    embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
+    embed.add_field(
+        name="🔁 En la ventana",
+        value=f"{summary.get('ssh_fails', 1)} intento(s)",
+        inline=True,
+    )
+    method = str(event.get("method") or "")
+    if method and method != "none":
+        embed.add_field(name="🔑 Metodo", value=f"`{method}`", inline=True)
+    if external:
+        embed.add_field(
+            name="🏠 Origen", value="⚠️ Fuera de la red local", inline=True
+        )
+    users = summary.get("users") or []
+    if len(users) > 1:
+        embed.add_field(
+            name="👥 Cuentas probadas",
+            value=", ".join(f"`{item}`" for item in users[:10]),
+            inline=False,
+        )
+    if node:
+        embed.set_footer(text=f"Nodo: {node}")
+    return embed
+
+
+def _should_notify_fail(store, key, now, cooldown=SSH_FAIL_NOTIFY_COOLDOWN):
+    if now - store.get(key, datetime.min) < cooldown:
+        return False
+    store[key] = now
+    return True
+
+
+@tasks.loop(minutes=SSH_KEY_REFRESH_MIN)
+async def refresh_key_directories():
+    """Relee los authorized_keys, local y remoto.
+
+    Periodico y no una sola vez al arrancar: agregar una clave nueva no
+    deberia exigir reiniciar el bot para que deje de reportarse como
+    desconocida.
+    """
+    entries, covered = await asyncio.to_thread(_read_local_key_directory)
+    local_key_directory.load(entries, covered_users=covered)
+    if remote_arch is None:
+        return
+    try:
+        payload = await remote_arch.request("keys")
+    except RemoteHostError as error:
+        if DEBUG_MODE:
+            print(f"No se pudo leer el directorio de claves remoto: {error}",
+                  file=sys.stderr)
+        return
+    remote_entries, remote_covered = _load_remote_key_entries(payload)
+    remote_key_directory.load(remote_entries, covered_users=remote_covered)
+
+
+# ==========================================
 # SSH WATCHER (MULTI-DISTRO)
 # ==========================================
 async def watch_ssh_logs():
@@ -923,12 +1175,19 @@ async def _process_ssh_login(channel, line):
         SAFE_SUBNETS,
         correlated=cf_event is not None,
     )
+    identity, recognized = _key_identity_field(local_key_directory, event)
+    verdict = _assess_login(SERVER_NAME, event, local_key_directory, timestamp)
+    suspicious = bool(verdict and verdict.suspicious)
     embed = discord.Embed(
-        title="🔑 Nuevo Login SSH",
+        title="🚨 Login SSH sospechoso" if suspicious else "🔑 Nuevo Login SSH",
         color=(
-            0xf1c40f
-            if origin["unresolved_proxy"]
-            else (0x2ecc71 if origin["is_local"] else 0xe67e22)
+            0xff0000
+            if suspicious
+            else (
+                0xf1c40f
+                if origin["unresolved_proxy"] or not recognized
+                else (0x2ecc71 if origin["is_local"] else 0xe67e22)
+            )
         ),
     )
     embed.add_field(name="👤 Usuario", value=f"`{user}`", inline=True)
@@ -942,6 +1201,14 @@ async def _process_ssh_login(channel, line):
         value=origin["label"],
         inline=True,
     )
+    embed.add_field(name="🔐 Clave", value=identity, inline=False)
+    anomalies = _anomaly_field(verdict)
+    if anomalies:
+        embed.add_field(
+            name="🚩 Anomalías" if suspicious else "ℹ️ Notas",
+            value=anomalies,
+            inline=False,
+        )
     if cf_event:
         embed.add_field(
             name="☁️ Cloudflare Access",
@@ -978,6 +1245,18 @@ async def _process_ssh_fail(channel, line):
     )
     recent_fails = summary["ssh_fails"]
     alert_key = f"bruteforce:{ip}"
+    # Por debajo del umbral de fuerza bruta se avisa igual, pero acotado por
+    # IP: es la unica forma de enterarse de un intento aislado contra una
+    # cuenta real, que es justo el caso que el umbral nunca alcanza.
+    if (
+        SSH_FAIL_NOTIFY_ENABLED
+        and event
+        and recent_fails < SSH_FAIL_THRESHOLD
+        and _should_notify_fail(ssh_fail_notified, f"local:{ip}", now)
+    ):
+        await channel.send(
+            embed=_build_ssh_fail_embed(event, summary, node=SERVER_NAME)
+        )
     if (
         recent_fails >= SSH_FAIL_THRESHOLD
         and now - last_alert_time.get(alert_key, datetime.min) > ALERT_COOLDOWN
@@ -1139,6 +1418,35 @@ async def _remote_request(ctx, action, *args, status=None):
     return payload
 
 
+def _remote_top_field(snapshot, key="cpu"):
+    """Filas de procesos remotos, o el motivo por el que no las hay.
+
+    Nunca devuelve una tabla vacia haciendola pasar por medicion: en el primer
+    poll despues de un reinicio no existe muestra anterior contra la cual
+    calcular el delta de CPU, y decirlo es mas util que publicar ceros.
+    """
+    processes = (snapshot or {}).get("processes") or {}
+    rows = processes.get(key) or []
+    if not rows:
+        if not processes:
+            return "_El agente remoto no reporta procesos (versión antigua)._"
+        return "_Todavía sin muestra válida de procesos._"
+    if key == "cpu" and not processes.get("warm"):
+        return "_Primer muestreo tras reiniciar: sin ventana para medir CPU._"
+    lines = []
+    for row in rows[:4]:
+        value = row.get(key)
+        if value is None:
+            continue
+        name = str(row.get("container") or row.get("name") or "?")[:22]
+        bar = "█" * min(int(value / 10), 10)
+        lines.append(
+            f"`{name:<22}` {value:>5.1f}% `{bar}`\n"
+            f"　pid `{row.get('pid', '?')}`"
+        )
+    return "\n".join(lines) if lines else "_Sin procesos medibles._"
+
+
 def _remote_alarm_embed(event, snapshot):
     alarm = event["alarm"]
     value = event["value"]
@@ -1184,6 +1492,17 @@ def _remote_alarm_embed(event, snapshot):
             ),
             inline=False,
         )
+        # El equivalente remoto de lo que build_alarm_embed ya hacia local:
+        # una alarma de CPU al 98% sin decir quien la esta consumiendo obliga a
+        # abrir una sesion para averiguar lo que el bot ya tenia en la mano.
+        if alarm.name in ("cpu", "ram", "swap"):
+            embed.add_field(
+                name="Top procesos",
+                value=_remote_top_field(
+                    snapshot, "cpu" if alarm.name == "cpu" else "ram"
+                ),
+                inline=False,
+            )
         if alarm.name == "temp" and snapshot.get("temperatures"):
             temps = snapshot["temperatures"]
             hottest = max(temps, key=temps.get)
@@ -1593,6 +1912,11 @@ async def on_ready():
         watch_fail2ban.start()
     if cloudflare_client is not None and not watch_cloudflare_access.is_running():
         watch_cloudflare_access.start()
+    if not refresh_key_directories.is_running():
+        # Antes del primer login posible: sin el directorio cargado, toda clave
+        # se veria como no reconocida y el primer aviso seria un falso positivo.
+        await refresh_key_directories()
+        refresh_key_directories.start()
     if remote_arch is not None:
         for task in [
             watch_remote_arch,
@@ -1792,12 +2116,25 @@ async def _notify_remote_ssh_login(channel, event, timestamp):
         SAFE_SUBNETS,
         correlated=cloudflare_event is not None,
     )
+    identity, recognized = _key_identity_field(remote_key_directory, event)
+    verdict = _assess_login(
+        _remote_name(), event, remote_key_directory, timestamp
+    )
+    suspicious = bool(verdict and verdict.suspicious)
     embed = _remote_embed(
-        f"🔑 Nuevo Login SSH — {_remote_name()}",
+        (
+            f"🚨 Login SSH sospechoso — {_remote_name()}"
+            if suspicious
+            else f"🔑 Nuevo Login SSH — {_remote_name()}"
+        ),
         color=(
-            0xf1c40f
-            if origin["unresolved_proxy"]
-            else (0x2ecc71 if origin["is_local"] else 0xe67e22)
+            0xff0000
+            if suspicious
+            else (
+                0xf1c40f
+                if origin["unresolved_proxy"] or not recognized
+                else (0x2ecc71 if origin["is_local"] else 0xe67e22)
+            )
         ),
     )
     embed.add_field(
@@ -1813,6 +2150,14 @@ async def _notify_remote_ssh_login(channel, event, timestamp):
         value=origin["label"],
         inline=True,
     )
+    embed.add_field(name="🔐 Clave", value=identity, inline=False)
+    anomalies = _anomaly_field(verdict)
+    if anomalies:
+        embed.add_field(
+            name="🚩 Anomalías" if suspicious else "ℹ️ Notas",
+            value=anomalies,
+            inline=False,
+        )
     if cloudflare_event:
         embed.add_field(
             name="☁️ Cloudflare Access",
@@ -1852,6 +2197,16 @@ async def _notify_remote_ssh_fail(channel, event, timestamp):
     )
     key = f"bruteforce:{ip}"
     now = datetime.now()
+    if (
+        SSH_FAIL_NOTIFY_ENABLED
+        and summary["ssh_fails"] < REMOTE_ARCH_SSH_FAIL_THRESHOLD
+        and _should_notify_fail(
+            ssh_fail_notified, f"{_remote_name()}:{ip}", now
+        )
+    ):
+        await channel.send(embed=_build_ssh_fail_embed(
+            event, summary, node=_remote_name()
+        ))
     if (
         summary["ssh_fails"] >= REMOTE_ARCH_SSH_FAIL_THRESHOLD
         and now - remote_last_alert_time.get(key, datetime.min) > ALERT_COOLDOWN
@@ -2693,6 +3048,55 @@ async def who_online(ctx, host: str = None):
                 inline=True
             )
     await ctx.send(embed=embed)
+
+@bot.command(name='keys', aliases=['claves'])
+async def show_keys(ctx, host: str = None):
+    """Claves SSH que el nodo acepta, con el nombre que el bot les pone.
+
+    Existe para poder auditar el mapa sin entrar al servidor: si un login
+    aparece como "clave no reconocida", aca se ve si falta la clave en el
+    `authorized_keys` o si simplemente falta etiquetarla.
+    """
+    remote = _is_remote_alias(host)
+    directory = remote_key_directory if remote else local_key_directory
+    name = _remote_name() if remote else SERVER_NAME
+    if not directory.loaded:
+        return await ctx.send(
+            f"❌ El directorio de claves de **{name}** todavía no se cargó."
+        )
+    embed = discord.Embed(
+        title=f"🔐 Claves autorizadas — {name}",
+        description=(
+            f"{len(directory)} clave(s) · cuentas leídas: "
+            + (", ".join(f"`{user}`" for user in sorted(directory.covered_users))
+               or "_ninguna_")
+        ),
+        color=0x3498db,
+        timestamp=datetime.now(),
+    )
+    for fingerprint, entry in directory.items()[:20]:
+        label, _ = directory.describe(fingerprint)
+        users = ", ".join(sorted(directory.authorized_users(fingerprint))) or "?"
+        embed.add_field(
+            name=f"{label}",
+            value=(
+                f"`…{directory.short(fingerprint)}` · "
+                f"`{entry.get('key_type', '?')}`\ncuentas: `{users}`"
+            ),
+            inline=True,
+        )
+    if not len(directory):
+        embed.add_field(
+            name="Sin datos",
+            value=(
+                "No se pudo leer ningún `authorized_keys`. Revisá "
+                "`SSH_KEY_DIRECTORY_FILES` y los `BindReadOnlyPaths` del "
+                "drop-in de systemd."
+            ),
+            inline=False,
+        )
+    await ctx.send(embed=embed)
+
 
 @bot.command(name='temps')
 async def show_temps(ctx, host: str = None):
