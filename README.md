@@ -266,16 +266,44 @@ writable state to `/var/lib/centinela` and any constrained remote-agent key to
 currently, `docker` for container inspection and explicitly requested
 restarts. It must not belong to `sudo` or `lxd`.
 
-Because `ProtectHome=yes` empties `/home` for the service, the `authorized_keys`
-that feed the fingerprint-to-identity map have to be re-exposed one file at a
-time through the `BindReadOnlyPaths=` lines in the drop-in, matching
+Because the drop-in empties `/home` and `/root` for the service, the
+`authorized_keys` that feed the fingerprint-to-identity map have to be
+re-exposed one file at a time through the `BindReadOnlyPaths=` lines, matching
 `SSH_KEY_DIRECTORY_FILES`. These are public keys and the fingerprint already
 reaches the journal on every login; what is not granted is the `.ssh` directory
-itself. `BindReadOnlyPaths` only makes the file visible — Unix permissions still
-apply, so a root-owned `authorized_keys` also needs
-`setfacl -m u:centinela:r /root/.ssh/authorized_keys` to be readable. Without
-it the bot degrades honestly and reports root logins as unverifiable rather
-than unrecognized.
+itself.
+
+Note the drop-in sets `ProtectHome=tmpfs`, not `yes`. With `yes`, systemd mounts
+`/home` and `/root` as read-only mode-`000` directories and cannot create a
+mount point inside them, so every `BindReadOnlyPaths=-` under those paths is
+skipped silently — `systemctl show -p BindReadOnlyPaths` still lists them, but
+the files never appear. Verify the real outcome inside the namespace, not in the
+unit properties:
+
+```bash
+PID=$(systemctl show discord-bot -p MainPID --value)
+sudo ls -la /proc/$PID/root/root/.ssh/
+```
+
+`BindReadOnlyPaths` only makes the file visible — Unix permissions still apply,
+so a root-owned `authorized_keys` also needs
+`setfacl -m u:centinela:r /root/.ssh/authorized_keys` to be readable. The
+directories above it do not need an ACL: systemd creates the mount points
+itself, at mode `755`, inside the private tmpfs. Without the file ACL the bot
+degrades honestly and reports root logins as unverifiable rather than
+unrecognized.
+
+The ACL lives on the inode, so anything that replaces `authorized_keys` rather
+than editing it in place drops the grant silently — `ssh-copy-id`, most editors
+writing through a temporary file, and any script ending in `os.replace()`. The
+bot keeps running and quietly downgrades every login on that account to
+unverifiable. After touching an `authorized_keys` that feeds
+`SSH_KEY_DIRECTORY_FILES`, re-check and reapply:
+
+```bash
+getfacl -p /home/luca/.ssh/authorized_keys | grep centinela \
+  || sudo setfacl -m u:centinela:r /home/luca/.ssh/authorized_keys
+```
 
 The drop-in makes the OS, home directories, kernel interfaces and namespaces
 read-only or inaccessible, removes every process capability and enables
