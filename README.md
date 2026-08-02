@@ -293,6 +293,18 @@ itself, at mode `755`, inside the private tmpfs. Without the file ACL the bot
 degrades honestly and reports root logins as unverifiable rather than
 unrecognized.
 
+The ACL lives on the inode, so anything that replaces `authorized_keys` rather
+than editing it in place drops the grant silently — `ssh-copy-id`, most editors
+writing through a temporary file, and any script ending in `os.replace()`. The
+bot keeps running and quietly downgrades every login on that account to
+unverifiable. After touching an `authorized_keys` that feeds
+`SSH_KEY_DIRECTORY_FILES`, re-check and reapply:
+
+```bash
+getfacl -p /home/luca/.ssh/authorized_keys | grep centinela \
+  || sudo setfacl -m u:centinela:r /home/luca/.ssh/authorized_keys
+```
+
 The drop-in makes the OS, home directories, kernel interfaces and namespaces
 read-only or inaccessible, removes every process capability and enables
 `NoNewPrivileges`. Validate with `systemd-analyze verify discord-bot.service`,
