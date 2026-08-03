@@ -164,6 +164,110 @@ class BaselineTests(unittest.TestCase):
             verdict.texts,
         )
 
+    def test_an_odd_hour_alone_is_context_and_not_suspicion(self):
+        """La gente entra a cualquier hora: sola, la hora no encabeza una alarma.
+
+        Un aviso rojo por esto se ve igual que "el fingerprint no figura en
+        ningun authorized_keys", y cuando los dos se ven igual se dejan de leer
+        los dos.
+        """
+        self.train()
+        verdict = self.baseline.assess(
+            "mbp", login(), directory(), now=AT + timedelta(days=6, hours=7)
+        )
+        self.assertFalse(verdict.suspicious, verdict.texts)
+        self.assertEqual(verdict.severity, INFO)
+
+    def test_an_odd_hour_next_to_another_signal_does_weigh(self):
+        """Acompanada si suma: horario raro mas subred nueva es una historia."""
+        self.train()
+        verdict = self.baseline.assess(
+            "mbp",
+            login(ip="203.0.113.9"),
+            directory(),
+            now=AT + timedelta(days=6, hours=7),
+        )
+        self.assertTrue(verdict.suspicious)
+        self.assertTrue(
+            any(
+                reason["severity"] == WARNING and "agenda habitual" in reason["text"]
+                for reason in verdict.reasons
+            ),
+            verdict.reasons,
+        )
+
+    def test_the_hour_next_to_the_agenda_is_not_new(self):
+        """Los buckets son un corte arbitrario: 10:59 y 11:01 son lo mismo."""
+        self.train()
+        verdict = self.baseline.assess(
+            "mbp", login(), directory(), now=AT + timedelta(days=6, hours=1)
+        )
+        self.assertFalse(
+            any("agenda habitual" in text for text in verdict.texts),
+            verdict.texts,
+        )
+
+    def test_midnight_is_adjacent_to_the_last_hour_of_the_day(self):
+        """El reloj es circular: 23h y 00h son vecinas, no polos opuestos."""
+        for index in range(5):
+            self.baseline.observe(
+                "mbp",
+                login(),
+                now=AT.replace(hour=2, minute=0) + timedelta(days=index),
+            )
+        # 02:00 UTC son las 23h locales; el login cae 00h local, la hora de al lado.
+        verdict = self.baseline.assess(
+            "mbp",
+            login(),
+            directory(),
+            now=AT.replace(hour=3, minute=0) + timedelta(days=9),
+        )
+        self.assertFalse(
+            any("agenda habitual" in text for text in verdict.texts),
+            verdict.texts,
+        )
+
+    def test_a_person_with_a_handful_of_habitual_hours_has_no_agenda(self):
+        """El caso real del 2026-08-03: seis franjas seguian contando como agenda.
+
+        La regla vieja admitia hasta seis franjas distintas, asi que una persona
+        se volvia mas sospechosa cuanto mas historia acumulaba, y dejaba de
+        alertar recien al aparecer la septima hora.
+        """
+        for index, hour in enumerate([9, 10, 17, 18, 21, 22] * 3):
+            self.baseline.observe(
+                "mbp",
+                login(),
+                now=AT.replace(hour=(hour + 3) % 24) + timedelta(days=index),
+            )
+        verdict = self.baseline.assess(
+            "mbp",
+            login(),
+            directory(),
+            now=AT.replace(hour=14) + timedelta(days=40),
+        )
+        self.assertFalse(
+            any("agenda habitual" in text for text in verdict.texts),
+            verdict.texts,
+        )
+
+    def test_a_single_stray_hour_does_not_build_an_agenda(self):
+        """Una entrada aislada no puede pesar como la hora habitual."""
+        for index in range(30):
+            self.baseline.observe(
+                "mbp", login(), now=AT + timedelta(days=index)
+            )
+        self.baseline.observe(
+            "mbp", login(), now=AT.replace(hour=6) + timedelta(days=31)
+        )
+        verdict = self.baseline.assess(
+            "mbp", login(), directory(), now=AT + timedelta(days=40, hours=7)
+        )
+        self.assertTrue(
+            any("agenda habitual" in text for text in verdict.texts),
+            verdict.texts,
+        )
+
     def test_interactive_key_at_any_hour_is_not_flagged(self):
         """Una clave sin agenda no puede violar una agenda que no tiene."""
         for index, hour in enumerate([1, 6, 9, 13, 17, 21, 23]):

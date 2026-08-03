@@ -46,9 +46,18 @@ _SEVERITY_ORDER = {INFO: 0, WARNING: 1, CRITICAL: 2}
 # Con dos logins previos, el tercero desde otra subred no es una anomalia: es
 # que todavia no sabemos como se comporta esa clave.
 MIN_OBSERVATIONS = 5
-# Cuantas franjas horarias distintas admite un perfil antes de considerarse sin
-# agenda. Dokploy entra siempre 20:50 (1 franja); una persona no.
-SCHEDULED_HOUR_SPAN = 6
+# Cuantas franjas horarias admite una agenda, y que porcion de los logins tienen
+# que caer dentro de ellas. Se mide por concentracion y no por cantidad de
+# franjas distintas: lo que define a un robot es que casi todos sus logins caigan
+# siempre en las mismas horas -- Dokploy entra 20:50 todos los dias --, no que
+# alguna vez se lo haya visto a otra hora. Contar franjas distintas hacia lo
+# contrario de lo necesario: cuantas mas horas acumulaba una persona, mas cerca
+# quedaba del umbral, y la regla se equivocaba mas justo antes de apagarse sola.
+SCHEDULE_COVERAGE = 0.9
+SCHEDULED_HOUR_SPAN = 2
+# Los buckets horarios son un corte arbitrario sobre algo continuo: sin margen,
+# entrar 10:59 es rutina y entrar 11:01 es sospechoso.
+HOUR_NEIGHBOURHOOD = 1
 # A partir de cuantas subredes distintas se asume que la clave es movil y deja
 # de avisarse por origen nuevo.
 ROAMING_SUBNETS = 4
@@ -109,6 +118,39 @@ def is_private(ip):
     except ValueError:
         return False
     return any(address in network for network in _INTERNAL_NETWORKS)
+
+
+def hour_distance(left, right):
+    """Distancia en horas tratando el reloj como circular: 23h y 00h son vecinas."""
+    gap = abs(int(left) - int(right)) % 24
+    return min(gap, 24 - gap)
+
+
+def scheduled_hours(hours):
+    """Las franjas que concentran los logins, o None si la clave no tiene agenda.
+
+    Se ordenan las franjas por frecuencia y se toma el prefijo mas corto que
+    cubre `SCHEDULE_COVERAGE` del total. Si ese nucleo necesita mas franjas de
+    las que admite una agenda, la clave entra a cualquier hora y no hay horario
+    contra el cual llamar rara a una hora.
+
+    Mirar los conteos y no solo las franjas presentes es lo que evita que una
+    entrada aislada -- vista una vez entre doscientas -- pese lo mismo que la
+    hora habitual y termine fabricando una agenda a partir de ruido.
+    """
+    total = sum(hours.values())
+    if total <= 0:
+        return None
+    core = set()
+    covered = 0
+    for hour, count in sorted(
+        hours.items(), key=lambda item: (-item[1], item[0])
+    ):
+        if covered >= total * SCHEDULE_COVERAGE:
+            break
+        core.add(hour)
+        covered += count
+    return core if len(core) <= SCHEDULED_HOUR_SPAN else None
 
 
 class Assessment:
@@ -338,29 +380,39 @@ class LoginBaseline:
                 f"{', '.join(sorted(sources))}.",
             )
 
-        hours = {
-            int(hour): count
-            for hour, count in (profile.get("hours") or {}).items()
-            if str(hour).isdigit()
-        }
-        current_hour = moment.astimezone().hour
-        if (
-            hours
-            and len(hours) <= SCHEDULED_HOUR_SPAN
-            and current_hour not in hours
-        ):
-            observed = ", ".join(f"{hour:02d}h" for hour in sorted(hours))
-            verdict.add(
-                WARNING,
-                f"Horario fuera de la agenda habitual de esta clave "
-                f"({observed}).",
-            )
-
         methods = profile.get("methods") or {}
         if method and methods and method not in methods:
             verdict.add(
                 WARNING,
                 f"Metodo de autenticacion nuevo para esta clave: `{method}`.",
+            )
+
+        # El horario se evalua al final a proposito, porque su severidad depende
+        # de lo que haya aparecido antes: la gente entra a cualquier hora, asi
+        # que una hora inusual sola es contexto, no sospecha. Elevarla a rojo por
+        # si misma hacia que un aviso debil se viera igual que "el fingerprint no
+        # figura en ningun authorized_keys", y cuando los dos se ven igual se
+        # dejan de leer los dos. Acompanada de otra senal -- subred nueva,
+        # usuario nuevo, metodo nuevo -- si suma, y ahi si pesa.
+        hours = {
+            int(hour): int(count)
+            for hour, count in (profile.get("hours") or {}).items()
+            if str(hour).isdigit() and int(count or 0) > 0
+        }
+        agenda = scheduled_hours(hours) if hours else None
+        current_hour = moment.astimezone().hour
+        # La cercania se mide contra todas las franjas vistas, no solo contra el
+        # nucleo: una hora que ya ocurrio alguna vez no es una novedad, aunque
+        # sea rara.
+        if agenda and all(
+            hour_distance(current_hour, hour) > HOUR_NEIGHBOURHOOD
+            for hour in hours
+        ):
+            observed = ", ".join(f"{hour:02d}h" for hour in sorted(agenda))
+            verdict.add(
+                WARNING if verdict.suspicious else INFO,
+                f"Horario fuera de la agenda habitual de esta clave "
+                f"({observed}).",
             )
         return verdict
 
