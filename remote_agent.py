@@ -29,6 +29,9 @@ CONFIG_PATH = os.getenv(
 )
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 MAX_OUTPUT = 200_000
+# Beyond this the previous sample stops describing the interval the alarms
+# evaluate.  Generous against the 2-5 minute poll, tight against an outage.
+MAX_STATE_AGE_S = 900
 
 
 def load_config():
@@ -137,10 +140,18 @@ def _state_path():
     ``/run`` is tmpfs: the state dies with the host, which is correct, since a
     CPU delta across a reboot is meaningless.  A user-owned fallback keeps the
     agent working when ``/run`` is not writable by an unprivileged account.
+
+    ``/run/user/$UID`` is deliberately NOT a candidate.  It is writable, so it
+    passes every check here, but with ``Linger=no`` systemd tears the whole
+    directory down about ten seconds after the agent's SSH session ends.  Each
+    poll then recreates it empty, every reading looks like the first one after
+    a reboot, and the alarms lose the process names for good -- a failure that
+    is invisible because writing the state always succeeds.
     """
     for candidate in (
         os.getenv("CENTINELA_AGENT_STATE"),
-        f"/run/user/{os.getuid()}/centinela-agent",
+        # Provisioned by deploy/centinela-agent.tmpfiles.conf.  Preferred: it
+        # is tmpfs (dies with the host) and it outlives the login session.
         "/run/centinela-agent",
         os.path.join(
             os.getenv("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
@@ -229,10 +240,18 @@ def process_attribution(limit=5):
     """
     path = _state_path()
     previous = _read_state(path) if path else {}
+    boot = round(psutil.boot_time(), 3)
+    now = time.time()
     previous_at = float(previous.get("at") or 0.0)
     previous_procs = previous.get("procs") or {}
-    now = time.time()
     elapsed = now - previous_at if previous_at else 0.0
+    # The fallback state directory outlives a reboot, and the bot can be down
+    # for hours.  Averaging CPU over a window that wide answers a question
+    # nobody asked: the alarm fired on the last few minutes, so a stale sample
+    # is discarded rather than diluted into a reassuring number.
+    if abs(float(previous.get("boot") or boot) - boot) > 1.0 or elapsed > MAX_STATE_AGE_S:
+        previous_procs = {}
+        elapsed = 0.0
 
     current = {}
     rows = []
@@ -272,7 +291,9 @@ def process_attribution(limit=5):
         })
 
     if path:
-        _write_state(path, {"at": round(now, 3), "procs": current})
+        _write_state(
+            path, {"at": round(now, 3), "boot": boot, "procs": current}
+        )
 
     measured = [row for row in rows if row["cpu"] is not None]
     top_cpu = sorted(measured, key=lambda row: row["cpu"], reverse=True)[:limit]
