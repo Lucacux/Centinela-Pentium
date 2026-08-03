@@ -40,6 +40,7 @@ from security_events import (
 )
 from ssh_baseline import CRITICAL as ANOMALY_CRITICAL, LoginBaseline
 from docker_ops import (
+    display_name,
     docker_cmd,
     get_docker_stats,
     group_services,
@@ -1755,6 +1756,29 @@ async def _remote_services_command(ctx):
     await ctx.send(embed=embed)
 
 
+def _remote_services(containers):
+    """Agrupa la respuesta cruda del agente igual que hace !ct local.
+
+    El agente manda `docker ps -a` sin tocar, asi que bajo Swarm cada servicio
+    llega dos veces: la task nueva corriendo y la vieja en Exited(255) que dejo
+    el ultimo deploy. Sin agrupar, la mitad de la lista son fantasmas rojos que
+    parecen caidas, y cada nombre arrastra 25 caracteres de task id.
+    """
+    tasks_in = []
+    for item in containers:
+        name = item.get("name") or "?"
+        service = service_of(name)
+        tasks_in.append({
+            **item,
+            "name": name,
+            "service": service,
+            "display": display_name(service, swarm=service != name),
+            "status": item.get("status") or item.get("state") or "",
+            "running": (item.get("state") or "").lower() == "running",
+        })
+    return group_services(tasks_in)
+
+
 async def _remote_containers_command(ctx):
     payload = await _remote_request(ctx, "docker")
     if not payload:
@@ -1764,54 +1788,87 @@ async def _remote_containers_command(ctx):
     containers = payload.get("containers") or []
     if not containers:
         return await ctx.send(f"🐳 **{_remote_name()}** no tiene contenedores.")
-    down = sum(
-        1 for item in containers if item.get("state", "").lower() != "running"
-    )
+    services = _remote_services(containers)
+    down = sum(1 for s in services if not s["current"]["running"])
     embed = _remote_embed(
         f"🐳 Contenedores — {_remote_name()}",
         color=0xe74c3c if down else 0x2ecc71,
     )
-    for item in containers[:18]:
-        state = item.get("state", "").lower()
+    for service in services[:18]:
+        item = service["current"]
         icon = {"running": "🟢", "restarting": "🔄", "exited": "🔴"}.get(
-            state, "🟡"
+            (item.get("state") or "").lower(), "🟡"
         )
-        value = (
-            f"`{item.get('status') or state or '?'}`\n"
-            f"`{item.get('image') or '?'}`"
-        )
+        value = f"`{item['status'] or '?'}`\n`{item.get('image') or '?'}`"
         if item.get("ports"):
             value += f"\n`{item['ports'][:70]}`"
         value += (
             f"\nCPU: `{item.get('cpu', 0):.1f}%` "
             f"RAM: `{item.get('ram', 0):.1f}%`"
         )
+        if service["stale"]:
+            value += f"\n_{service['stale']} task(s) vieja(s) sin limpiar_"
         embed.add_field(
-            name=f"{icon} {item.get('name') or '?'}",
-            value=value,
-            inline=True,
+            name=f"{icon} {service['display']}", value=value, inline=True
         )
+    if len(services) > 18:
+        embed.set_footer(text=f"...y {len(services) - 18} servicio(s) mas")
     await ctx.send(embed=embed)
 
 
+async def _remote_resolve(ctx, wanted):
+    """Traduce lo que se tipeo al nombre real del contenedor en el nodo remoto.
+
+    Cuesta un viaje SSH extra, pero sin esto la lista miente: !ct muestra
+    "parse-solid-state-bus" y `docker logs` de la otra punta no conoce ese
+    nombre, ni tampoco el del servicio de Swarm — solo el de la task.
+    """
+    payload = await _remote_request(ctx, "docker")
+    if not payload or not payload.get("available"):
+        return None
+    services = _remote_services(payload.get("containers") or [])
+    target = wanted.strip().lower()
+    for service in services:
+        if target in (
+            service["display"].lower(),
+            service["service"].lower(),
+            service["current"]["name"].lower(),
+        ):
+            return service
+    for service in services:
+        if target in service["display"].lower() or target in service["service"].lower():
+            return service
+    await ctx.send(
+        f"❌ No encontré `{wanted}` en **{_remote_name()}**. "
+        f"Mirá `!ct {_remote_name()}`."
+    )
+    return None
+
+
 async def _remote_logs_command(ctx, service):
-    payload = await _remote_request(ctx, "logs", service, 25)
+    target = await _remote_resolve(ctx, service)
+    if not target:
+        return
+    payload = await _remote_request(ctx, "logs", target["current"]["name"], 25)
     if not payload:
         return
-    embed = _remote_embed(f"📋 Logs: {service}")
+    embed = _remote_embed(f"📋 Logs: {target['display']}")
     embed.description = f"```\n{(payload.get('output') or 'Sin salida.')[-1800:]}\n```"
     await ctx.send(embed=embed)
 
 
 async def _remote_restart_command(ctx, service):
+    target = await _remote_resolve(ctx, service)
+    if not target:
+        return
     payload = await _remote_request(
-        ctx, "restart", service,
-        status=f"🔄 Reiniciando `{service}` en **{_remote_name()}**...",
+        ctx, "restart", target["current"]["name"],
+        status=f"🔄 Reiniciando `{target['display']}` en **{_remote_name()}**...",
     )
     if not payload:
         return
     await ctx.send(embed=_remote_embed(
-        f"✅ Reiniciado: {service}",
+        f"✅ Reiniciado: {target['display']}",
         description=f"Por **{ctx.author.display_name}**.",
         color=0x2ecc71,
     ))
@@ -2330,24 +2387,30 @@ async def watch_remote_docker():
         name = container.get("name") or ""
         if not name:
             continue
+        # `name` sigue siendo la task: es con lo que hay que hablarle a Docker.
+        # `shown` es como se nombra al humano, y ademas es estable entre deploys,
+        # asi que sirve de clave de cooldown — con el task id, un redeploy
+        # reseteaba el silencio y la misma alarma volvia a sonar.
+        service = service_of(name)
+        shown = display_name(service, swarm=service != name)
         state = (container.get("state") or "").lower()
         if state == "restarting":
-            previous_heal = remote_docker_heal_attempts.get(name, datetime.min)
+            previous_heal = remote_docker_heal_attempts.get(service, datetime.min)
             if now - previous_heal > HEAL_TIMEOUT:
-                remote_docker_heal_attempts[name] = now
+                remote_docker_heal_attempts[service] = now
                 try:
                     await remote_arch.request("heal", name, timeout=70)
                     remote_stats_counter["docker_alerts"] += 1
                     await channel.send(embed=_remote_embed(
                         f"🩹 Auto-Healing — {_remote_name()}",
-                        description=f"`{name}` estaba reiniciando y fue reiniciado.",
+                        description=f"`{shown}` estaba reiniciando y fue reiniciado.",
                         color=0x3498db,
                     ))
                 except RemoteHostError as error:
                     await channel.send(embed=_remote_embed(
                         f"🔄 Docker Loop — {_remote_name()}",
                         description=(
-                            f"`{name}` sigue reiniciando y el intento de "
+                            f"`{shown}` sigue reiniciando y el intento de "
                             f"recuperación falló.\n`{str(error)[:500]}`"
                         ),
                         color=0xe67e22,
@@ -2355,7 +2418,7 @@ async def watch_remote_docker():
                 continue
         cpu = float(container.get("cpu", 0))
         ram = float(container.get("ram", 0))
-        alert_key = f"resource:{name}"
+        alert_key = f"resource:{service}"
         if (
             (cpu > 90 or ram > 90)
             and now - remote_last_docker_alert.get(
@@ -2363,7 +2426,7 @@ async def watch_remote_docker():
             ) > ALERT_COOLDOWN
         ):
             embed = _remote_embed(
-                f"🐳 Alto Consumo — {name} — {_remote_name()}",
+                f"🐳 Alto Consumo — {shown} — {_remote_name()}",
                 color=0xe67e22,
             )
             if cpu > 90:
@@ -3249,7 +3312,7 @@ async def check_containers(ctx, host: str = None):
             value += f"\nCPU: `{st['cpu']:.1f}%` RAM: `{st['mem_pct']:.1f}%`"
         if s["stale"]:
             value += f"\n_{s['stale']} task(s) vieja(s) sin limpiar_"
-        embed.add_field(name=f"{icon} {s['service']}", value=value, inline=True)
+        embed.add_field(name=f"{icon} {s['display']}", value=value, inline=True)
     if len(services) > 15:
         embed.set_footer(text=f"...y {len(services) - 15} servicio(s) mas")
     await ctx.send(embed=embed)
