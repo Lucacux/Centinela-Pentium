@@ -28,6 +28,10 @@ CONFIG_PATH = os.getenv(
     "CENTINELA_AGENT_CONFIG", "/etc/centinela-agent.json"
 )
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+# Un ID de imagen pelado, que es lo que muestra `docker ps` cuando la etiqueta
+# local ya no existe. Anclado y sin puntos ni barras, asi que no puede comerse
+# una referencia real como "ghcr.io/open-webui/open-webui:main".
+IMAGE_ID_RE = re.compile(r"^(?:sha256:)?[0-9a-f]{12,64}$")
 MAX_OUTPUT = 200_000
 # Beyond this the previous sample stops describing the interval the alarms
 # evaluate.  Generous against the 2-5 minute poll, tight against an outage.
@@ -509,6 +513,38 @@ def smart_health(allow_sudo=True):
     return {"available": True, "device": "", "output": ""}
 
 
+def resolve_image_ids(containers):
+    """Cambia los IDs pelados de imagen por la referencia que se pidio.
+
+    Cuando la etiqueta local desaparece -- porque Watchtower bajo una imagen
+    nueva y la vieja quedo colgando -- `docker ps` deja de tener un nombre que
+    mostrar y escupe el ID: "1f84517eca8e" en vez de "valkey/valkey:8.1". El
+    contenedor igual recuerda con que referencia lo levantaron, en Config.Image.
+
+    Un solo `docker inspect` para todos los afectados, y solo si hay alguno.
+    """
+    pending = [c for c in containers if IMAGE_ID_RE.fullmatch(c.get("image") or "")]
+    if not pending:
+        return
+    code, raw = run(
+        ["docker", "inspect", "--format", "{{.Name}}|{{.Config.Image}}"]
+        + [c["name"] for c in pending if c.get("name")],
+        timeout=20,
+    )
+    if code != 0:
+        return
+    resolved = {}
+    for line in raw.splitlines():
+        name, _, image = line.partition("|")
+        name, image = name.strip().lstrip("/"), image.strip()
+        # Config.Image puede ser el mismo ID si lo levantaron por ID: no aporta.
+        if name and image and not IMAGE_ID_RE.fullmatch(image):
+            resolved[name] = image
+    for container in pending:
+        if container["name"] in resolved:
+            container["image"] = resolved[container["name"]]
+
+
 def docker_containers():
     if not shutil.which("docker"):
         return {"available": False, "containers": []}
@@ -528,6 +564,7 @@ def docker_containers():
             "image": value.get("Image", ""),
             "ports": value.get("Ports", ""),
         })
+    resolve_image_ids(containers)
 
     _, raw_stats = run(
         ["docker", "stats", "--no-stream", "--format", "{{json .}}"],

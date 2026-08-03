@@ -106,3 +106,59 @@ class StateFreshnessTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResolveImageIdsTest(unittest.TestCase):
+    """`docker ps` muestra el ID pelado cuando la etiqueta local se perdio."""
+
+    def _resolve(self, containers, inspect_output, code=0):
+        calls = []
+
+        def fake_run(argv, timeout=None):
+            calls.append(argv)
+            return code, inspect_output
+
+        with patch.object(remote_agent, "run", side_effect=fake_run):
+            remote_agent.resolve_image_ids(containers)
+        return calls
+
+    def test_replaces_the_id_with_the_reference_it_was_started_with(self):
+        containers = [
+            {"name": "truly-valkey", "image": "1f84517eca8e"},
+            {"name": "thinky-webui", "image": "18c1475e6362"},
+        ]
+        self._resolve(
+            containers,
+            "/truly-valkey|valkey/valkey:8.1\n"
+            "/thinky-webui|ghcr.io/open-webui/open-webui:main",
+        )
+        self.assertEqual(containers[0]["image"], "valkey/valkey:8.1")
+        self.assertEqual(containers[1]["image"], "ghcr.io/open-webui/open-webui:main")
+
+    def test_does_not_touch_images_that_already_have_a_name(self):
+        containers = [{"name": "truly-postgres", "image": "postgres:17.7"}]
+        calls = self._resolve(containers, "")
+        # Sin nada que resolver no se gasta un inspect.
+        self.assertEqual(calls, [])
+        self.assertEqual(containers[0]["image"], "postgres:17.7")
+
+    def test_keeps_the_id_when_config_image_is_also_an_id(self):
+        # Si lo levantaron por ID no hay nombre lindo que recuperar; mentir
+        # seria peor que mostrar el ID.
+        containers = [{"name": "raro", "image": "1f84517eca8e"}]
+        self._resolve(containers, "/raro|1f84517eca8e")
+        self.assertEqual(containers[0]["image"], "1f84517eca8e")
+
+    def test_survives_a_failing_inspect(self):
+        containers = [{"name": "truly-valkey", "image": "1f84517eca8e"}]
+        self._resolve(containers, "no such object", code=1)
+        self.assertEqual(containers[0]["image"], "1f84517eca8e")
+
+    def test_a_real_reference_is_never_mistaken_for_an_id(self):
+        for image in (
+            "ghcr.io/open-webui/open-webui:main",
+            "postgres:17.7",
+            "aquasec/trivy:latest",
+            "dev-api",
+        ):
+            self.assertIsNone(remote_agent.IMAGE_ID_RE.fullmatch(image), image)
