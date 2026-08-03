@@ -44,6 +44,7 @@ from docker_ops import (
     docker_cmd,
     get_docker_stats,
     group_services,
+    is_anonymous,
     list_tasks,
     resolve_service,
     restart_service,
@@ -2418,7 +2419,13 @@ async def watch_remote_docker():
                 continue
         cpu = float(container.get("cpu", 0))
         ram = float(container.get("ram", 0))
-        alert_key = f"resource:{service}"
+        image = container.get("image") or "?"
+        # Un contenedor sin --name se llama distinto en cada corrida, asi que la
+        # clave por nombre no silenciaba nada: cada escaneo de Trivy que lanza
+        # Vuln-Sentinel volvia a alarmar con otro nombre al azar. Para esos la
+        # identidad estable es la imagen.
+        anonymous = is_anonymous(name)
+        alert_key = f"resource:{image if anonymous else service}"
         if (
             (cpu > 90 or ram > 90)
             and now - remote_last_docker_alert.get(
@@ -2426,7 +2433,7 @@ async def watch_remote_docker():
             ) > ALERT_COOLDOWN
         ):
             embed = _remote_embed(
-                f"🐳 Alto Consumo — {shown} — {_remote_name()}",
+                f"🐳 Alto Consumo — {image if anonymous else shown} — {_remote_name()}",
                 color=0xe67e22,
             )
             if cpu > 90:
@@ -2436,6 +2443,19 @@ async def watch_remote_docker():
                     name="RAM",
                     value=f"**{ram:.1f}%** ({container.get('mem_usage', '')})",
                     inline=True,
+                )
+            embed.add_field(name="Imagen", value=f"`{image}`", inline=False)
+            if anonymous:
+                # No se silencia: un contenedor anonimo comiendose la CPU es
+                # exactamente como se ve un minero. Se lo hace identificable.
+                embed.add_field(
+                    name="Contenedor efímero",
+                    value=(
+                        f"`{name}` — lanzado sin `--name`, Docker lo bautizó al "
+                        "azar y para cuando leas esto probablemente ya no exista. "
+                        "Se identifica por la imagen."
+                    ),
+                    inline=False,
                 )
             await channel.send(embed=embed)
             remote_last_docker_alert[alert_key] = now

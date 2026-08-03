@@ -5,6 +5,7 @@ import docker_ops
 from docker_ops import (
     display_name,
     group_services,
+    is_anonymous,
     resolve_service,
     restart_service,
     service_of,
@@ -87,6 +88,28 @@ class DisplayNameTests(unittest.TestCase):
         first = task("app-parse-solid-state-bus-x4h5mo.1.mspes4bzsmh4zn3bju5k4o6by")
         second = task("app-parse-solid-state-bus-x4h5mo.1.pigmb85ormpxkiuzmz1cdltru")
         self.assertEqual(first["display"], second["display"])
+
+
+class IsAnonymousTests(unittest.TestCase):
+    def test_detects_the_names_docker_invents(self):
+        # Los dos son reales: alarmaron en server-mbp con 100% de CPU y para
+        # cuando se miraba el contenedor ya no existia. Eran escaneos de Trivy.
+        self.assertTrue(is_anonymous("affectionate_montalcini"))
+        self.assertTrue(is_anonymous("competent_shaw"))
+
+    def test_leaves_names_a_person_chose(self):
+        for name in (
+            "truly-postgres",
+            "borgmatic_truly_db",
+            "vuln-sentinel-trivy-server",
+            "watchtower",
+            "dokploy-redis",
+        ):
+            self.assertFalse(is_anonymous(name), name)
+
+    def test_empty_name_is_not_anonymous(self):
+        self.assertFalse(is_anonymous(""))
+        self.assertFalse(is_anonymous(None))
 
 
 class GroupServicesTests(unittest.TestCase):

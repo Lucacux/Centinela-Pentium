@@ -34,9 +34,29 @@ COMMON_TAILS = frozenset({
 })
 
 
+# `docker run` sin --name deja que Docker invente "adjetivo_apellido":
+# affectionate_montalcini, competent_shaw. El nombre es distinto en cada corrida.
+DOCKER_RANDOM_NAME = re.compile(r'^[a-z]+_[a-z]+$')
+
+
 def service_of(container):
     """discordbots-mediabot.1.s4aflfw1qys6... -> discordbots-mediabot"""
     return TASK_SUFFIX.sub('', container)
+
+
+def is_anonymous(container):
+    """True si el nombre lo invento Docker, no una persona.
+
+    Importa para las alarmas: un nombre que cambia en cada corrida no sirve ni
+    para identificar al contenedor ni para silenciarlo. La identidad estable de
+    un contenedor efimero es su imagen.
+
+    Puede dar falso positivo con un contenedor que alguien haya llamado
+    "mi_app". El costo es solo la granularidad del cooldown, asi que se prefiere
+    equivocarse para este lado antes que dejar de agrupar los efimeros de
+    verdad, que son los que hacen ruido.
+    """
+    return bool(DOCKER_RANDOM_NAME.fullmatch(container or ""))
 
 
 def display_name(service, swarm=True):
