@@ -101,6 +101,67 @@ The periodic Guardian report waits five minutes after a bot restart before its
 first Fleet Overview render.  This prevents deployments from competing with a
 cold image renderer; tune it with `GRAFANA_GUARDIAN_START_DELAY_SECONDS`.
 
+### 💾 Fleet backups
+
+```
+!backups              # the whole backup system, host by host
+!backups <host>       # narrow it to one host
+!backups local        # this host's Borg repo, straight off the filesystem
+!backups arch         # the remote node, through its agent
+```
+
+State is read from the **metrics the backup system already publishes**
+(`homelab-backup`: Ansible + Borg 1.x + borgmatic, append-only), not by
+SSH-ing into every host. One credential instead of N, it still answers when a
+host is powered off, and it does not open a second privileged path into the
+fleet.
+
+**Nothing about the fleet is hardcoded.** There is no list of hosts, repos or
+tenants anywhere in `backup_monitor.py`: every row in the report comes from
+the labels of the series. A host that joins the backup system shows up on its
+own. The only fixed thing is the metric names, which are the contract with the
+backup repo:
+
+| Metric | Written by | Answers |
+|---|---|---|
+| `backup_last_success_timestamp_seconds{host,repo}` | client, per run | how old is the newest good backup |
+| `backup_last_exit_code{host,repo}` | client, per run | did the last attempt fail (even if an older one succeeded) |
+| `backup_last_duration_seconds` / `backup_repo_size_bytes` | client, per run | how long it took, how much it holds |
+| `backup_restore_test_last_success_timestamp_seconds{host,repo}` | repo host, weekly | was a restore actually verified |
+| `backup_canary_age_hours{host,repo}` | repo host, weekly | is the repo healthy but *unwritten* — a dead client timer |
+| `borg_maintenance_*` / `borg_check_*` | repo host | prune and `check --verify-data` recency |
+| `borg_repo_size_bytes` / `borg_repo_archives` / `borg_repo_host_free_bytes` | repo host | growth and headroom |
+
+Two things worth knowing about how it queries:
+
+- Every metric is wrapped in `last_over_time(<metric>[14d])`. Prometheus drops
+  a series ~5 min after its exporter stops answering, so a plain query makes a
+  host whose `node_exporter` died **disappear** from the report — the one
+  failure mode you most want to see. The lookback keeps it visible, in red,
+  with its last known value.
+- `0` means *never*, not 1970. The backup scripts write `0` when there has
+  never been a successful run, and preserve the previous timestamp when an
+  attempt fails; the report reads both the same way the scripts write them.
+
+**Reaching Prometheus.** Set `BACKUP_PROMETHEUS_URL` if the bot can hit it
+directly. If not — the usual case, since Prometheus tends to be firewalled
+while Grafana is open — leave it empty and the queries go through **Grafana's
+datasource proxy**, reusing the `GRAFANA_URL` / `GRAFANA_TOKEN` that
+`!grafana` already needs. No new credential, no new firewall rule. The
+datasource UID is discovered at runtime (`/api/datasources`, falling back to
+reading dashboard panels, which a Viewer token can do), so recreating the
+datasource does not break the bot. Pin it with
+`BACKUP_PROMETHEUS_DATASOURCE` if you would rather not discover.
+
+Two loops, on purpose: `watch_backup_fleet` runs hourly and only speaks on a
+**severity transition** (plus a reminder every `BACKUP_ALERT_REMINDER_HOURS`
+while it stays degraded), while `backup_fleet_report` posts the full report
+every `BACKUP_REPORT_EVERY_HOURS` whether or not anything is wrong. A channel
+that only talks when something breaks is indistinguishable from a dead bot.
+
+With no metrics source configured the command falls back to `BACKUP_PATH`
+exactly as before — the feature is additive.
+
 ### 🌐 Network diagnostics
 
 `!red` (aliases `!net`, `!diag`) replaces the old boolean "internet is down" check
@@ -352,6 +413,16 @@ See [`.env.example`](./.env.example) for the full list:
 | `GEOIP_COUNTRY_DB` / `GEOIP_COUNTRY_LOCALE` | Local Country MMDB path and preferred country-name language |
 | `SWAP_ALERT_PCT` / `TEMP_ALERT_C` | Resource alert thresholds |
 | `GRAFANA_URL` / `GRAFANA_TOKEN` | Grafana API URL and Viewer service-account token |
+| `BACKUP_PATH` | Local Borg repo, checked by mtime of its `index.*`. Also the fallback when no metrics source is set |
+| `BACKUP_PROMETHEUS_URL` | Prometheus for the fleet backup report. Empty = go through Grafana's datasource proxy |
+| `BACKUP_PROMETHEUS_DATASOURCE` | Pin the datasource UID instead of discovering it at runtime |
+| `BACKUP_REPORT_EVERY_HOURS` / `BACKUP_REPORT_ALWAYS` | Cadence of the full periodic report, and whether to send it when everything is fine |
+| `BACKUP_ALERT_REMINDER_HOURS` | How often a still-degraded backup is repeated after the first alert |
+| `BACKUP_STALE_WARNING_HOURS` / `BACKUP_STALE_CRITICAL_HOURS` | When a backup counts as late (26 h) and as broken (48 h, the alert the backup system was designed around) |
+| `BACKUP_RESTORE_TEST_*_DAYS` / `BACKUP_CANARY_WARNING_HOURS` | Restore-verification and canary freshness thresholds |
+| `BACKUP_PRUNE_WARNING_DAYS` / `BACKUP_CHECK_WARNING_DAYS` | Retention and `check --verify-data` recency thresholds |
+| `BACKUP_FREE_WARNING_GB` / `BACKUP_FREE_CRITICAL_GB` | Headroom left on the repo hosts |
+| `BACKUP_METRIC_LOOKBACK_DAYS` | `last_over_time` window that keeps a dead exporter's host visible instead of vanishing |
 | `GRAFANA_GUARDIAN_*` | Fleet panel, range, dimensions, and enable/disable switch for Guardian Report |
 | `ISP_GUARDIAN_URL` | ISP Uplink Guardian API, read-only. Empty = ONU layer skipped, everything else still works |
 | `NET_DNS_PROBE` / `NET_DNS_EXTERNAL` | Name to resolve, and the contrast resolver that isolates a broken local DNS |
