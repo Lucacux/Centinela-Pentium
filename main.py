@@ -4,7 +4,6 @@ import psutil
 import subprocess
 import shutil
 import os
-import glob
 import asyncio
 import signal
 import sys
@@ -17,6 +16,7 @@ import json
 import netdiag
 import procmon
 import alerts
+import backup_monitor
 from alerts import ALARM, CRITICAL, NO_DATA, OK, WARNING, Alarm, AlarmEngine
 from grafana import GrafanaClient, GrafanaError, parse_range
 from fleet_report import render_fleet_pages
@@ -57,6 +57,32 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID_ENV = os.getenv('DISCORD_CHANNEL_ID')
 DEBUG_MODE = os.getenv('DEBUG_MODE', 'false').lower() in ('true', '1', 'yes')
 BACKUP_PATH = os.getenv('BACKUP_PATH', '')
+
+# --- SISTEMA DE BACKUPS DE LA FLOTA (ver backup_monitor.py) ---
+# El estado se lee de las metricas que ya publica homelab-backup, no por SSH.
+# Dos caminos: Prometheus directo, o el proxy de datasource de Grafana (que
+# reusa GRAFANA_URL/GRAFANA_TOKEN y no necesita abrir el 9090 a nadie).
+# Sin ninguno de los dos configurado, `!backups` sigue funcionando como antes
+# contra BACKUP_PATH: la feature es aditiva.
+BACKUP_PROMETHEUS_URL = os.getenv('BACKUP_PROMETHEUS_URL', '').rstrip('/')
+BACKUP_PROMETHEUS_DATASOURCE = os.getenv('BACKUP_PROMETHEUS_DATASOURCE', '').strip()
+BACKUP_HTTP_TIMEOUT = int(os.getenv('BACKUP_HTTP_TIMEOUT_SECONDS', '20'))
+BACKUP_REPORT_EVERY_H = int(os.getenv('BACKUP_REPORT_EVERY_HOURS', '12'))
+BACKUP_REPORT_ALWAYS = os.getenv(
+    'BACKUP_REPORT_ALWAYS', 'true'
+).lower() in ('true', '1', 'yes')
+BACKUP_ALERT_REMINDER_H = int(os.getenv('BACKUP_ALERT_REMINDER_HOURS', '12'))
+BACKUP_REPORT_ON_START = os.getenv(
+    'BACKUP_REPORT_ON_START', 'true'
+).lower() in ('true', '1', 'yes')
+# Avisos de corrida: arranco / termino / cuando es el proximo. Se consulta cada
+# minuto porque la pregunta es "¿esta pasando AHORA?"; es una sola consulta
+# instantanea que trae las diez series del orquestador.
+BACKUP_RUN_WATCH_MIN = max(1, int(os.getenv('BACKUP_RUN_WATCH_MINUTES', '1')))
+BACKUP_RUN_ANNOUNCE = os.getenv(
+    'BACKUP_RUN_ANNOUNCE', 'true'
+).lower() in ('true', '1', 'yes')
+BACKUP_POLICY = backup_monitor.BackupPolicy.from_env()
 SAFE_SUBNETS = [s.strip() for s in os.getenv('SAFE_SUBNETS', '192.168.,10.,172.').split(',')]
 SERVER_NAME = os.getenv('SERVER_NAME', 'Server')
 WATCHED_SERVICES = [s.strip() for s in os.getenv('WATCHED_SERVICES', '').split(',') if s.strip()]
@@ -143,6 +169,9 @@ _STATE_DIR = (
 )
 SSH_BASELINE_PATH = os.getenv(
     'SSH_BASELINE_PATH', os.path.join(_STATE_DIR, 'ssh-baseline.json')
+)
+BACKUP_RUN_STATE_PATH = os.getenv(
+    'BACKUP_RUN_STATE_PATH', os.path.join(_STATE_DIR, 'backup-run.json')
 )
 SSH_ANOMALY_ENABLED = os.getenv(
     'SSH_ANOMALY_ENABLED', 'true'
@@ -345,7 +374,9 @@ remote_security_seen_order = deque(maxlen=4000)
 remote_last_alert_time = {}
 remote_last_docker_alert = {}
 remote_docker_heal_attempts = {}
-remote_backup_alerted = False
+remote_backup_alert = backup_monitor.AlertState(
+    reminder=timedelta(hours=BACKUP_ALERT_REMINDER_H)
+)
 remote_stats_counter = {
     "ssh_events": 0,
     "ssh_fails": 0,
@@ -891,16 +922,145 @@ def get_service_logs(service_name, lines=5):
         return ""
 
 # ==========================================
-# HELPER BACKUP BORG
+# BACKUPS (ver backup_monitor.py)
 # ==========================================
-def get_borg_last_backup(repo_path):
-    """Devuelve (mtime: datetime, index_file: str) del index.* mas reciente en el repo Borg."""
-    candidates = glob.glob(os.path.join(repo_path, "index.*"))
-    if not candidates:
-        return None, None
-    newest = max(candidates, key=os.path.getmtime)
-    mtime = datetime.fromtimestamp(os.path.getmtime(newest))
-    return mtime, newest
+# La logica —umbrales, parseo de metricas, redaccion— vive en backup_monitor.
+# Aca queda solo el pegamento con Discord. Antes habia cuatro copias de "esto
+# esta viejo si pasaron 25 h" (comando local, watcher local, comando remoto,
+# watcher remoto) que ya habian empezado a divergir.
+_backup_source_cache = None
+backup_source_failed = False
+backup_alert_state = backup_monitor.AlertState(
+    reminder=timedelta(hours=BACKUP_ALERT_REMINDER_H)
+)
+local_backup_alert = backup_monitor.AlertState(
+    reminder=timedelta(hours=BACKUP_ALERT_REMINDER_H)
+)
+# Mensaje del aviso de "backup en curso", para editarlo con el avance en vez de
+# postear uno nuevo por host. Solo dura lo que dure el proceso: si el bot se
+# reinicia a mitad de corrida, el proximo aviso es un mensaje nuevo y listo.
+backup_run_message = None
+
+
+def backup_fleet_configured():
+    return bool(BACKUP_PROMETHEUS_URL or (GRAFANA_URL and GRAFANA_TOKEN))
+
+
+async def get_backup_source():
+    """Fuente de metricas de backup, resuelta una sola vez y cacheada.
+
+    Prometheus directo gana si esta configurado. Si no, se va por Grafana y se
+    descubre el UID del datasource en caliente (un token Viewer alcanza), para
+    no hardcodear un UID que cambia si el datasource se recrea.
+    """
+    global _backup_source_cache
+    if _backup_source_cache is not None:
+        return _backup_source_cache
+
+    if BACKUP_PROMETHEUS_URL:
+        _backup_source_cache = backup_monitor.direct_source(
+            BACKUP_PROMETHEUS_URL, timeout=BACKUP_HTTP_TIMEOUT
+        )
+        return _backup_source_cache
+
+    if not (GRAFANA_URL and GRAFANA_TOKEN):
+        raise backup_monitor.BackupMonitorError(
+            "no hay fuente de metricas: configura BACKUP_PROMETHEUS_URL, "
+            "o GRAFANA_URL + GRAFANA_TOKEN para ir por el proxy de Grafana."
+        )
+
+    uid = BACKUP_PROMETHEUS_DATASOURCE
+    if not uid:
+        http = backup_monitor.HttpJson(
+            GRAFANA_URL,
+            headers={"Authorization": f"Bearer {GRAFANA_TOKEN}"},
+            timeout=BACKUP_HTTP_TIMEOUT,
+        )
+        uid = await backup_monitor.discover_prometheus_datasource(http)
+
+    _backup_source_cache = backup_monitor.grafana_proxy_source(
+        GRAFANA_URL, GRAFANA_TOKEN, uid, timeout=BACKUP_HTTP_TIMEOUT
+    )
+    return _backup_source_cache
+
+
+def embed_from_view(view, timestamp=None):
+    """Traduce una ReportView (sin dependencias de Discord) a un embed."""
+    embed = discord.Embed(
+        title=view.title,
+        description=view.description or None,
+        color=view.color,
+        timestamp=timestamp,
+    )
+    for field in view.fields[:25]:
+        embed.add_field(name=field.name[:256], value=field.value[:1024], inline=field.inline)
+    if view.footer:
+        embed.set_footer(text=view.footer[:2048])
+    return embed
+
+
+async def fetch_backup_report():
+    source = await get_backup_source()
+    return await backup_monitor.collect_report(source, BACKUP_POLICY)
+
+
+async def fetch_backup_run():
+    source = await get_backup_source()
+    return await backup_monitor.collect_run_status(source)
+
+
+def load_backup_run_state():
+    """Lo ultimo que se anuncio de una corrida, de la sesion anterior.
+
+    Persiste porque el Centinela vive en pentium, que el propio backup enciende
+    a las 03:00 y apaga al terminar: entre el "arranco" y el "termino" este
+    proceso se muere. En memoria, el aviso de fin no llegaria nunca — o llegaria
+    de nuevo en cada arranque del bot.
+    """
+    try:
+        with open(BACKUP_RUN_STATE_PATH, encoding='utf-8') as handle:
+            state = json.load(handle)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_backup_run_state(state):
+    directory = os.path.dirname(BACKUP_RUN_STATE_PATH) or '.'
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        tmp = f"{BACKUP_RUN_STATE_PATH}.tmp"
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            json.dump(state, handle, separators=(',', ':'))
+        os.replace(tmp, BACKUP_RUN_STATE_PATH)
+    except OSError as error:
+        if DEBUG_MODE:
+            print(f"No pude guardar el estado de la corrida: {error}", file=sys.stderr)
+
+
+backup_run_announcer = backup_monitor.RunAnnouncer(load_backup_run_state())
+
+
+async def _backup_run_or_none():
+    """Estado de la corrida, o None si no se puede leer.
+
+    El reporte de flota no depende de esto: si el orquestador no responde, el
+    reporte sale igual sin la seccion de la corrida. Un dato de mas no puede
+    tumbar el reporte entero.
+    """
+    try:
+        return await fetch_backup_run()
+    except backup_monitor.BackupMonitorError as error:
+        if DEBUG_MODE:
+            print(f"Estado de la corrida: {error}", file=sys.stderr)
+        return None
+
+
+async def local_backup_view():
+    status = await asyncio.to_thread(
+        backup_monitor.inspect_local_repo, BACKUP_PATH, SERVER_NAME
+    )
+    return backup_monitor.render_local(status, BACKUP_POLICY)
 
 # ==========================================
 # IDENTIDAD DE CLAVES SSH
@@ -1909,48 +2069,9 @@ async def _remote_backups_command(ctx):
     payload = await _remote_request(ctx, "backup")
     if not payload:
         return
-    if not payload.get("configured"):
-        return await ctx.send(
-            f"❌ Backup no configurado en **{_remote_name()}**."
-        )
-    if not payload.get("exists"):
-        return await ctx.send(
-            f"❌ El repositorio de backup de **{_remote_name()}** no existe."
-        )
-    timestamp = payload.get("last_timestamp")
-    if not timestamp:
-        return await ctx.send(
-            f"❌ No se encontró `index.*` en el backup de **{_remote_name()}**."
-        )
-    modified = datetime.fromtimestamp(timestamp)
-    age = datetime.now() - modified
-    healthy = age < timedelta(hours=25)
-    embed = _remote_embed(
-        f"💾 Backup Borg — {_remote_name()}",
-        color=0x2ecc71 if healthy else 0xff0000,
-    )
-    embed.add_field(
-        name="Índice", value=f"`{payload.get('index', '?')}`", inline=False
-    )
-    embed.add_field(
-        name="Última ejecución",
-        value=modified.strftime("%d/%m/%Y %H:%M"),
-        inline=True,
-    )
-    embed.add_field(
-        name="Antigüedad", value=str(age).split(".")[0], inline=True
-    )
-    embed.add_field(
-        name="Tamaño repo",
-        value=format_bytes(payload.get("size", 0)),
-        inline=True,
-    )
-    embed.add_field(
-        name="Estado",
-        value="✅ Al día" if healthy else "🔴 Desactualizado",
-        inline=False,
-    )
-    await ctx.send(embed=embed)
+    status = backup_monitor.local_status_from_payload(payload, label=_remote_name())
+    view = backup_monitor.render_local(status, BACKUP_POLICY)
+    await ctx.send(embed=embed_from_view(view))
 
 
 # ==========================================
@@ -1964,6 +2085,10 @@ async def on_ready():
             task.start()
     if BACKUP_PATH and not watch_backups.is_running():
         watch_backups.start()
+    if backup_fleet_configured():
+        for task in [watch_backup_fleet, backup_fleet_report, watch_backup_runs]:
+            if not task.is_running():
+                task.start()
     if WATCHED_SERVICES and not watch_services.is_running():
         watch_services.start()
     if FAIL2BAN_ENABLED and not watch_fail2ban.is_running():
@@ -2007,7 +2132,7 @@ async def on_ready():
             "`!restart <s>` Reiniciar un servicio\n\n"
             "**Mantenimiento**\n"
             "`!updates`   Actualizaciones\n"
-            "`!backups`   Estado de backups\n\n"
+            "`!backups`   Backups de la flota (`local`, `<host>`)\n\n"
             "**Nodo Arch unificado**\n"
             "`!arch`      Panel remoto\n"
             "`!arch help` Comandos del nodo remoto\n"
@@ -2464,7 +2589,6 @@ async def watch_remote_docker():
 
 @tasks.loop(hours=24)
 async def watch_remote_backups():
-    global remote_backup_alerted
     channel = bot.get_channel(CHANNEL_ID)
     if not channel or remote_arch is None:
         return
@@ -2474,30 +2598,15 @@ async def watch_remote_backups():
         if DEBUG_MODE:
             print(f"Remote backup watcher: {error}", file=sys.stderr)
         return
-    timestamp = payload.get("last_timestamp")
-    stale = (
-        payload.get("configured")
-        and payload.get("exists")
-        and (
-            not timestamp
-            or datetime.now() - datetime.fromtimestamp(timestamp)
-            > timedelta(hours=25)
-        )
-    )
-    if stale and not remote_backup_alerted:
-        remote_backup_alerted = True
-        await channel.send(embed=_remote_embed(
-            f"🚨 Backup desactualizado — {_remote_name()}",
-            description=(
-                "El repositorio no tiene un índice reciente."
-                if not timestamp else
-                "Último índice: "
-                f"`{datetime.fromtimestamp(timestamp):%d/%m/%Y %H:%M}`."
-            ),
-            color=0xff0000,
+    status = backup_monitor.local_status_from_payload(payload, label=_remote_name())
+    assessment = status.assess(BACKUP_POLICY, datetime.now())
+    # Sin configurar no es una alarma: es un nodo que no participa del sistema.
+    if assessment.severity == backup_monitor.NO_DATA:
+        return
+    if remote_backup_alert.should_notify(assessment.severity):
+        await channel.send(embed=embed_from_view(
+            backup_monitor.render_local(status, BACKUP_POLICY)
         ))
-    elif not stale:
-        remote_backup_alerted = False
 
 
 @tasks.loop(minutes=1)
@@ -2799,25 +2908,128 @@ async def watch_docker_resources():
 
 @tasks.loop(hours=24)
 async def watch_backups():
+    """Repo Borg local. Solo habla cuando cambia el estado, no cada 24 h."""
     channel = bot.get_channel(CHANNEL_ID)
-    if not channel or not BACKUP_PATH or not os.path.exists(BACKUP_PATH):
+    if not channel or not BACKUP_PATH:
         return
-    # FIX: Borg no crea archivos nuevos, actualiza index.* — chequeamos su mtime
-    last_mtime, index_file = await asyncio.to_thread(get_borg_last_backup, BACKUP_PATH)
-    if last_mtime is None:
-        await channel.send(embed=discord.Embed(
-            title="🚨 Repo Borg sin índice",
-            description=f"No se encontró `index.*` en `{BACKUP_PATH}`.",
-            color=0xff0000
+    status = await asyncio.to_thread(
+        backup_monitor.inspect_local_repo, BACKUP_PATH, SERVER_NAME
+    )
+    assessment = status.assess(BACKUP_POLICY, datetime.now())
+    if assessment.severity == backup_monitor.NO_DATA:
+        return
+    if local_backup_alert.should_notify(assessment.severity):
+        await channel.send(embed=embed_from_view(
+            backup_monitor.render_local(status, BACKUP_POLICY)
         ))
+
+
+@tasks.loop(hours=1)
+async def watch_backup_fleet():
+    """Vigila el sistema de backups de la flota y avisa en las transiciones.
+
+    Corre seguido y habla poco: el reporte completo lo manda
+    `backup_fleet_report`, esto es la alarma. Un backup que se rompe a las
+    04:00 no puede esperar al reporte de las 12 h.
+    """
+    global backup_source_failed
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or not backup_fleet_configured():
         return
-    age = datetime.now() - last_mtime
-    if age > timedelta(hours=25):
-        embed = discord.Embed(title="🚨 Backup Desactualizado", color=0xff0000)
-        embed.add_field(name="Índice", value=f"`{os.path.basename(index_file)}`", inline=True)
-        embed.add_field(name="Antigüedad", value=str(age).split('.')[0], inline=True)
-        embed.add_field(name="Última modificación", value=last_mtime.strftime('%d/%m/%Y %H:%M'), inline=True)
-        await channel.send(embed=embed)
+    try:
+        report = await fetch_backup_report()
+    except backup_monitor.BackupMonitorError as error:
+        # Que no se pueda consultar el estado de los backups es, en sí, algo
+        # que hay que saber: se avisa una vez y no se repite hasta que vuelva.
+        if not backup_source_failed:
+            backup_source_failed = True
+            await channel.send(embed=discord.Embed(
+                title="⚪ No pude leer el estado de los backups",
+                description=str(error)[:1500],
+                color=backup_monitor.SEVERITY_COLOR[backup_monitor.NO_DATA],
+            ))
+        elif DEBUG_MODE:
+            print(f"Backup fleet watcher: {error}", file=sys.stderr)
+        return
+
+    backup_source_failed = False
+    if backup_alert_state.should_notify(report.severity):
+        await channel.send(embed=embed_from_view(
+            backup_monitor.render_fleet(report, run=await _backup_run_or_none()),
+            timestamp=report.generated_at,
+        ))
+
+
+@tasks.loop(minutes=BACKUP_RUN_WATCH_MIN)
+async def watch_backup_runs():
+    """Avisa cuando un backup arranca, cuando termina y cuando es el proximo.
+
+    Es lo mismo que hace el Updates-Bot con el update diario: un mensaje al
+    empezar que se va editando con el avance, y el resultado al final. Un
+    backup de la flota que dura dos horas y solo se anuncia al terminar es
+    indistinguible, mientras pasa, de uno que no arranco nunca.
+    """
+    global backup_run_message
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or not backup_fleet_configured() or not BACKUP_RUN_ANNOUNCE:
+        return
+    try:
+        run = await fetch_backup_run()
+    except backup_monitor.BackupMonitorError as error:
+        # Silencioso a proposito: quien avisa que no se puede leer el estado de
+        # los backups es watch_backup_fleet, y una vez sola. Este loop corre
+        # cada minuto; si tambien avisara serian 60 mensajes por hora.
+        if DEBUG_MODE:
+            print(f"Backup run watcher: {error}", file=sys.stderr)
+        return
+
+    for announcement in backup_run_announcer.observe(run):
+        embed = embed_from_view(announcement.view, timestamp=datetime.now())
+        if announcement.kind == 'started':
+            backup_run_message = await channel.send(embed=embed)
+        else:
+            await channel.send(embed=embed)
+            backup_run_message = None
+        save_backup_run_state(backup_run_announcer.dump())
+
+    # Avance: se edita el mensaje del arranque en vez de postear uno por host.
+    if run.running and backup_run_message is not None:
+        try:
+            await backup_run_message.edit(embed=embed_from_view(
+                backup_monitor.render_run_progress(run), timestamp=datetime.now()
+            ))
+        except discord.HTTPException as error:
+            # El mensaje pudo borrarse. No vale la pena romper el loop por eso.
+            if DEBUG_MODE:
+                print(f"No pude editar el aviso de backup: {error}", file=sys.stderr)
+            backup_run_message = None
+
+
+@tasks.loop(hours=max(1, BACKUP_REPORT_EVERY_H))
+async def backup_fleet_report():
+    """El reporte periódico: sale siempre, esté todo bien o mal.
+
+    Ver un ✅ cada tanto es la única forma de saber que el monitoreo sigue
+    vivo. Un canal que solo habla cuando algo se rompe es indistinguible de
+    un bot caído.
+    """
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or not backup_fleet_configured() or not BACKUP_REPORT_ALWAYS:
+        return
+    # El deploy es un git-pull con restart: sin esta guarda, cada push manda un
+    # reporte de backups que nadie pidio.
+    if backup_fleet_report.current_loop == 0 and not BACKUP_REPORT_ON_START:
+        return
+    try:
+        report = await fetch_backup_report()
+    except backup_monitor.BackupMonitorError as error:
+        if DEBUG_MODE:
+            print(f"Backup fleet report: {error}", file=sys.stderr)
+        return
+    await channel.send(embed=embed_from_view(
+        backup_monitor.render_fleet(report, run=await _backup_run_or_none()),
+        timestamp=report.generated_at,
+    ))
 
 @tasks.loop(hours=6)
 async def guardian_report():
@@ -3358,30 +3570,57 @@ async def check_os_updates(ctx, host: str = None):
     await msg.edit(content=None, embed=embed)
 
 @bot.command(name='backups')
-async def check_backups(ctx, host: str = None):
-    if _is_remote_alias(host):
+async def check_backups(ctx, target: str = None):
+    """Estado de los backups.
+
+    `!backups`          → la flota entera (o el repo local si no hay métricas)
+    `!backups next`     → cuándo es el próximo backup y cómo salió el último
+    `!backups local`    → el repo Borg de este host
+    `!backups arch`     → el nodo remoto, vía su agente
+    `!backups <host>`   → filtra el reporte de flota por host
+    """
+    if _is_remote_alias(target):
         return await _remote_backups_command(ctx)
-    if not BACKUP_PATH:
-        return await ctx.send("❌ `BACKUP_PATH` no configurado.")
-    if not os.path.exists(BACKUP_PATH):
-        return await ctx.send(f"❌ `{BACKUP_PATH}` no existe.")
-    # FIX: usar mtime del index.* de Borg en vez de buscar archivos nuevos
-    last_mtime, index_file = await asyncio.to_thread(get_borg_last_backup, BACKUP_PATH)
-    if last_mtime is None:
-        return await ctx.send(f"❌ No se encontró `index.*` en `{BACKUP_PATH}`.")
-    age = datetime.now() - last_mtime
-    repo_size = await asyncio.to_thread(
-        lambda: sum(os.path.getsize(os.path.join(r, f))
-                    for r, _, fs in os.walk(BACKUP_PATH) for f in fs)
-    )
-    is_ok = age < timedelta(hours=25)
-    embed = discord.Embed(title="💾 Backup Borg", color=0x2ecc71 if is_ok else 0xff0000)
-    embed.add_field(name="Índice", value=f"`{os.path.basename(index_file)}`", inline=False)
-    embed.add_field(name="Última ejecución", value=last_mtime.strftime('%d/%m/%Y %H:%M'), inline=True)
-    embed.add_field(name="Antigüedad", value=str(age).split('.')[0], inline=True)
-    embed.add_field(name="Tamaño repo", value=format_bytes(repo_size), inline=True)
-    embed.add_field(name="Estado", value="✅ Al día" if is_ok else "🔴 Desactualizado", inline=False)
-    await ctx.send(embed=embed)
+
+    if (target or "").strip().lower() in ("next", "proximo", "próximo", "run"):
+        if not backup_fleet_configured():
+            return await ctx.send(
+                "❌ No hay fuente de métricas configurada. Ver `BACKUP_PROMETHEUS_URL` "
+                "en el README."
+            )
+        try:
+            run = await fetch_backup_run()
+        except backup_monitor.BackupMonitorError as error:
+            return await ctx.send(f"❌ {str(error)[:1900]}")
+        if not run.present:
+            return await ctx.send(
+                "⚪ El orquestador de backups no está reportando. O todavía no se "
+                "desplegó, o su `.prom` no está llegando a Prometheus."
+            )
+        view = (
+            backup_monitor.render_run_progress(run)
+            if run.running
+            else backup_monitor.render_run_finished(run)
+        )
+        return await ctx.send(embed=embed_from_view(view, timestamp=datetime.now()))
+
+    wants_local = (target or "").strip().lower() in ("local", "host", "aca", "acá")
+    if wants_local or not backup_fleet_configured():
+        if not BACKUP_PATH:
+            return await ctx.send(
+                "❌ No hay `BACKUP_PATH` local ni fuente de métricas configurada. "
+                "Ver `BACKUP_PROMETHEUS_URL` en el README."
+            )
+        return await ctx.send(embed=embed_from_view(await local_backup_view()))
+
+    msg = await ctx.send("💾 **Consultando el estado de los backups...**")
+    try:
+        report = await fetch_backup_report()
+    except backup_monitor.BackupMonitorError as error:
+        return await msg.edit(content=f"❌ {str(error)[:1900]}")
+    run = await _backup_run_or_none()
+    view = backup_monitor.render_fleet(report, host_filter=target, run=run)
+    await msg.edit(content=None, embed=embed_from_view(view, timestamp=report.generated_at))
 
 # ==========================================
 # COMANDO GRAFANA (paneles del dashboard en el bot)
