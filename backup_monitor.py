@@ -160,12 +160,17 @@ class BackupPolicy:
     03:00 (+15 min de jitter), prune semanal, restore-test semanal, check
     mensual. El margen extra es para que un host que se enciende tarde no
     dispare rojo en el primer minuto.
+
+    Los tres umbrales críticos son, a propósito, los mismos que las alertas de
+    Grafana que define el RUNBOOK del repo de backups (48 h sin backup, 14 d
+    sin restauración verificada, 30 GB libres). Que Discord y Grafana digan
+    cosas distintas sobre el mismo repo entrena a no creerle a ninguno.
     """
 
     stale_warning: timedelta = timedelta(hours=26)
     stale_critical: timedelta = timedelta(hours=48)
     restore_test_warning: timedelta = timedelta(days=8)
-    restore_test_critical: timedelta = timedelta(days=15)
+    restore_test_critical: timedelta = timedelta(days=14)
     prune_warning: timedelta = timedelta(days=10)
     check_warning: timedelta = timedelta(days=40)
     canary_warning: timedelta = timedelta(hours=26)
@@ -187,7 +192,7 @@ class BackupPolicy:
             stale_warning=hours("BACKUP_STALE_WARNING_HOURS", 26),
             stale_critical=hours("BACKUP_STALE_CRITICAL_HOURS", 48),
             restore_test_warning=days("BACKUP_RESTORE_TEST_WARNING_DAYS", 8),
-            restore_test_critical=days("BACKUP_RESTORE_TEST_CRITICAL_DAYS", 15),
+            restore_test_critical=days("BACKUP_RESTORE_TEST_CRITICAL_DAYS", 14),
             prune_warning=days("BACKUP_PRUNE_WARNING_DAYS", 10),
             check_warning=days("BACKUP_CHECK_WARNING_DAYS", 40),
             canary_warning=hours("BACKUP_CANARY_WARNING_HOURS", 26),

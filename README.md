@@ -419,7 +419,7 @@ See [`.env.example`](./.env.example) for the full list:
 | `BACKUP_REPORT_EVERY_HOURS` / `BACKUP_REPORT_ALWAYS` | Cadence of the full periodic report, and whether to send it when everything is fine |
 | `BACKUP_ALERT_REMINDER_HOURS` | How often a still-degraded backup is repeated after the first alert |
 | `BACKUP_STALE_WARNING_HOURS` / `BACKUP_STALE_CRITICAL_HOURS` | When a backup counts as late (26 h) and as broken (48 h, the alert the backup system was designed around) |
-| `BACKUP_RESTORE_TEST_*_DAYS` / `BACKUP_CANARY_WARNING_HOURS` | Restore-verification and canary freshness thresholds |
+| `BACKUP_RESTORE_TEST_*_DAYS` / `BACKUP_CANARY_WARNING_HOURS` | Restore-verification and canary freshness thresholds. The 14-day critical is the same number as the backup RUNBOOK's Grafana alert, on purpose |
 | `BACKUP_PRUNE_WARNING_DAYS` / `BACKUP_CHECK_WARNING_DAYS` | Retention and `check --verify-data` recency thresholds |
 | `BACKUP_FREE_WARNING_GB` / `BACKUP_FREE_CRITICAL_GB` | Headroom left on the repo hosts |
 | `BACKUP_METRIC_LOOKBACK_DAYS` | `last_over_time` window that keeps a dead exporter's host visible instead of vanishing |
