@@ -30,6 +30,17 @@ Repo host — `scripts/restore-test.sh` → `borg_restore_test_<host>.prom`:
     backup_restore_test_last_success_timestamp_seconds{host,repo}
     backup_canary_age_hours{host,repo}
 
+Orquestador — `scripts/backup-orchestrator.py` → `backup-orchestrator.prom`:
+    backup_run_state, backup_run_result, backup_run_duration_seconds
+    backup_run_started_timestamp_seconds, backup_run_finished_timestamp_seconds
+    backup_next_run_timestamp_seconds
+    backup_run_host_state{host}, backup_run_host_woken{host}
+    backup_run_host_duration_seconds{host}
+
+Las primeras describen el CONTENIDO de los repos ("¿hay un backup reciente?").
+Las del orquestador describen el PROCESO ("¿está corriendo uno ahora?"), y son
+las que permiten avisar cuando un backup arranca en vez de solo cuando terminó.
+
 En las métricas del repo host, `repo` es el *tenant*: de quién son los datos.
 
 Nada de esta infra está hardcodeado
@@ -75,10 +86,14 @@ __all__ = [
     "LocalRepoStatus",
     "RepoStatus",
     "ReportView",
+    "RunAnnouncer",
+    "RunStatus",
     "Sample",
     "AlertState",
     "build_report",
+    "build_run_status",
     "collect_report",
+    "collect_run_status",
     "discover_prometheus_datasource",
     "direct_source",
     "grafana_proxy_source",
@@ -87,6 +102,9 @@ __all__ = [
     "parse_instant_vector",
     "render_fleet",
     "render_local",
+    "render_run_finished",
+    "render_run_progress",
+    "render_run_started",
 ]
 
 
@@ -806,8 +824,13 @@ def _clip(text):
     return text if len(text) <= _FIELD_LIMIT else text[: _FIELD_LIMIT - 1] + "…"
 
 
-def render_fleet(report, host_filter=None, *, title="Backups de la flota"):
-    """Arma la vista del reporte de flota, opcionalmente filtrada por host."""
+def render_fleet(report, host_filter=None, *, title="Backups de la flota", run=None):
+    """Arma la vista del reporte de flota, opcionalmente filtrada por host.
+
+    `run` es el estado del orquestador. Va en el mismo reporte y no en uno
+    aparte porque "cuándo es el próximo backup" es la primera pregunta que
+    sigue a "cómo están los backups", y separarla obliga a pedir dos cosas.
+    """
     severity = report.severity
     needle = (host_filter or "").strip().lower()
 
@@ -897,6 +920,25 @@ def render_fleet(report, host_filter=None, *, title="Backups de la flota"):
             ViewField(name="💽 Espacio en los repo hosts", value=_clip("\n".join(lines)))
         )
 
+    if run is not None and run.present and not needle:
+        lines = []
+        if run.running:
+            current = run.current_host
+            lines.append(
+                "🔄 **Hay un backup corriendo ahora**"
+                + (f" — respaldando {current}" if current else "")
+            )
+        elif run.result is not None:
+            lines.append(
+                f"{SEVERITY_EMOJI[RESULT_SEVERITY.get(run.result, NO_DATA)]} "
+                f"Última corrida: {RESULT_LABEL.get(run.result, '?')}"
+                + (f" ({_when(run.finished)})" if run.finished else "")
+            )
+        lines.append(f"⏭ Próximo backup: {_next_run_line(run, report.generated_at)}")
+        if run.woken_hosts:
+            lines.append(f"🔌 Encendidos por WOL: {', '.join(run.woken_hosts)}")
+        fields.append(ViewField(name="🗓 La corrida", value=_clip("\n".join(lines))))
+
     if report.query_errors:
         fields.append(
             ViewField(
@@ -971,6 +1013,337 @@ def render_local(status, policy, now=None, *, title=None):
         color=SEVERITY_COLOR[assessment.severity],
         fields=tuple(fields),
     )
+
+
+# ── La corrida: qué está pasando ahora mismo ────────────────────────────────
+# Las métricas de arriba describen el CONTENIDO de los repos ("¿hay un backup
+# reciente?"). Estas describen el PROCESO ("¿está corriendo uno ahora?"), y las
+# publica el orquestador de homelab-backup en server-mbp. Son las que permiten
+# avisar cuando un backup arranca y no recién cuando terminó.
+M_RUN_STATE = "backup_run_state"
+M_RUN_STARTED = "backup_run_started_timestamp_seconds"
+M_RUN_FINISHED = "backup_run_finished_timestamp_seconds"
+M_RUN_DURATION = "backup_run_duration_seconds"
+M_RUN_RESULT = "backup_run_result"
+M_NEXT_RUN = "backup_next_run_timestamp_seconds"
+M_RUN_HOST_STATE = "backup_run_host_state"
+M_RUN_HOST_WOKEN = "backup_run_host_woken"
+M_RUN_HOST_DURATION = "backup_run_host_duration_seconds"
+
+# Una sola consulta trae las diez series. Se puede usar el regex sobre
+# `__name__` acá (y no en el reporte de flota) porque estas son consultas
+# instantáneas sin función de rango: el nombre sobrevive y llega en las
+# etiquetas. Importa porque este poll corre cada minuto.
+RUN_SELECTOR = '{__name__=~"backup_run_.*|backup_next_run_timestamp_seconds"}'
+
+HOST_PENDING, HOST_RUNNING, HOST_OK, HOST_FAILED, HOST_SKIPPED = 0, 1, 2, 3, 4
+RESULT_OK, RESULT_PARTIAL, RESULT_FAILED = 0, 1, 2
+
+HOST_STATE_EMOJI = {
+    HOST_PENDING: "⏳",
+    HOST_RUNNING: "🔄",
+    HOST_OK: "✅",
+    HOST_FAILED: "❌",
+    HOST_SKIPPED: "⏭",
+}
+HOST_STATE_LABEL = {
+    HOST_PENDING: "pendiente",
+    HOST_RUNNING: "corriendo",
+    HOST_OK: "ok",
+    HOST_FAILED: "falló",
+    HOST_SKIPPED: "omitido",
+}
+RESULT_SEVERITY = {RESULT_OK: OK, RESULT_PARTIAL: WARNING, RESULT_FAILED: CRITICAL}
+RESULT_LABEL = {
+    RESULT_OK: "todos los hosts respaldados",
+    RESULT_PARTIAL: "parcial: quedaron hosts sin respaldar",
+    RESULT_FAILED: "falló: no se respaldó ningún host",
+}
+
+
+@dataclass(frozen=True)
+class RunHost:
+    name: str
+    state: int = HOST_PENDING
+    woken: bool = False
+    duration: float | None = None
+
+    @property
+    def line(self) -> str:
+        emoji = HOST_STATE_EMOJI.get(self.state, "⚪")
+        parts = [f"{emoji} **{self.name}** — {HOST_STATE_LABEL.get(self.state, '?')}"]
+        if self.duration:
+            parts.append(f"({format_duration(self.duration)})")
+        if self.woken:
+            parts.append("🔌")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
+class RunStatus:
+    """Foto de la corrida del orquestador. Sin red y sin Discord."""
+
+    present: bool = False
+    running: bool = False
+    started: object = None
+    finished: object = None
+    duration: float | None = None
+    result: int | None = None
+    next_run: object = None
+    hosts: tuple = ()
+
+    @property
+    def woken_hosts(self) -> tuple:
+        return tuple(host.name for host in self.hosts if host.woken)
+
+    @property
+    def current_host(self):
+        for host in self.hosts:
+            if host.state == HOST_RUNNING:
+                return host.name
+        return None
+
+    def counts(self) -> dict:
+        states = [host.state for host in self.hosts]
+        return {
+            "total": len(states),
+            "ok": states.count(HOST_OK),
+            "failed": states.count(HOST_FAILED),
+            "skipped": states.count(HOST_SKIPPED),
+        }
+
+    @property
+    def severity(self) -> str:
+        if not self.present:
+            return NO_DATA
+        if self.running:
+            return OK
+        return RESULT_SEVERITY.get(self.result, NO_DATA)
+
+
+def group_by_metric_name(samples):
+    """{nombre de métrica: [Sample]} a partir de una consulta con `__name__`."""
+    grouped = {}
+    for sample in samples:
+        name = sample.labels.get("__name__")
+        if name:
+            grouped.setdefault(name, []).append(sample)
+    return grouped
+
+
+def _scalar(samples_by_metric, metric):
+    values = [s.value for s in samples_by_metric.get(metric, ())]
+    return max(values) if values else None
+
+
+def build_run_status(samples_by_metric) -> RunStatus:
+    """Arma la foto de la corrida. Función pura: sin red, sin reloj."""
+    state = _scalar(samples_by_metric, M_RUN_STATE)
+    if state is None:
+        return RunStatus(present=False)
+
+    by_host = {}
+    for metric, key in (
+        (M_RUN_HOST_STATE, "state"),
+        (M_RUN_HOST_WOKEN, "woken"),
+        (M_RUN_HOST_DURATION, "duration"),
+    ):
+        for sample in samples_by_metric.get(metric, ()):
+            by_host.setdefault(sample.host, {})[key] = sample.value
+
+    hosts = tuple(
+        RunHost(
+            name=name,
+            state=int(values.get("state", HOST_PENDING)),
+            woken=bool(values.get("woken")),
+            duration=values.get("duration") or None,
+        )
+        # Orden estable y previsible: primero lo que está pasando, después lo
+        # que salió mal. Un reporte que reordena solo es un reporte que hay que
+        # leer entero cada vez.
+        for name, values in sorted(by_host.items())
+    )
+    order = {HOST_RUNNING: 0, HOST_FAILED: 1, HOST_SKIPPED: 2, HOST_PENDING: 3, HOST_OK: 4}
+    hosts = tuple(sorted(hosts, key=lambda h: (order.get(h.state, 9), h.name)))
+
+    result = _scalar(samples_by_metric, M_RUN_RESULT)
+    return RunStatus(
+        present=True,
+        running=state >= 1,
+        started=_timestamp(_scalar(samples_by_metric, M_RUN_STARTED)),
+        finished=_timestamp(_scalar(samples_by_metric, M_RUN_FINISHED)),
+        duration=_scalar(samples_by_metric, M_RUN_DURATION),
+        result=None if result is None else int(result),
+        next_run=_timestamp(_scalar(samples_by_metric, M_NEXT_RUN)),
+        hosts=hosts,
+    )
+
+
+async def collect_run_status(source) -> RunStatus:
+    """Una sola consulta instantánea; corre cada minuto."""
+    return build_run_status(group_by_metric_name(await source.query(RUN_SELECTOR)))
+
+
+def _next_run_line(run, now=None):
+    if run.next_run is None:
+        return "sin timer"
+    now = now or datetime.now()
+    return f"{_when(run.next_run)} (en {format_age(run.next_run - now)})"
+
+
+def render_run_started(run, now=None) -> ReportView:
+    fields = []
+    if run.hosts:
+        fields.append(
+            ViewField(name="Hosts de esta corrida", value=_clip(
+                "\n".join(host.line for host in run.hosts)
+            ))
+        )
+    if run.woken_hosts:
+        fields.append(
+            ViewField(
+                name="🔌 Encendidos por WOL",
+                value=", ".join(run.woken_hosts),
+                inline=True,
+            )
+        )
+    return ReportView(
+        title="🔄 Backup de la flota en curso",
+        description=(
+            f"Arrancó {_when(run.started)}. Los nodos apagados se encienden por "
+            "WOL y vuelven a apagarse al terminar."
+        ),
+        color=0x3498DB,
+        fields=tuple(fields),
+        footer=f"Próximo backup: {_next_run_line(run, now)}",
+    )
+
+
+def render_run_progress(run, now=None) -> ReportView:
+    """Igual que el de arranque pero con el avance: se edita el mismo mensaje."""
+    view = render_run_started(run, now)
+    current = run.current_host
+    description = view.description
+    if current:
+        description = f"Respaldando **{current}**. " + description
+    return ReportView(
+        title=view.title,
+        description=description,
+        color=view.color,
+        fields=view.fields,
+        footer=view.footer,
+    )
+
+
+def render_run_finished(run, now=None) -> ReportView:
+    counts = run.counts()
+    severity = RESULT_SEVERITY.get(run.result, NO_DATA)
+    titles = {
+        RESULT_OK: "✅ Backup de la flota completado",
+        RESULT_PARTIAL: "🟠 Backup de la flota parcial",
+        RESULT_FAILED: "🔴 El backup de la flota falló",
+    }
+    fields = [
+        ViewField(name="Duración", value=format_duration(run.duration), inline=True),
+        ViewField(name="Terminó", value=_when(run.finished), inline=True),
+        ViewField(
+            name="Hosts",
+            value=(
+                f"{counts['ok']}/{counts['total']} ok"
+                + (f" · {counts['failed']} fallidos" if counts["failed"] else "")
+                + (f" · {counts['skipped']} omitidos" if counts["skipped"] else "")
+            ),
+            inline=True,
+        ),
+    ]
+    if run.hosts:
+        fields.append(
+            ViewField(name="Detalle", value=_clip(
+                "\n".join(host.line for host in run.hosts)
+            ))
+        )
+    if run.woken_hosts:
+        fields.append(
+            ViewField(
+                name="🔌 Encendidos por WOL",
+                value=(
+                    ", ".join(run.woken_hosts)
+                    + " — se devuelven a su estado anterior al terminar"
+                ),
+            )
+        )
+    return ReportView(
+        title=titles.get(run.result, "⚪ Corrida de backup terminada"),
+        description=RESULT_LABEL.get(run.result, "resultado desconocido"),
+        color=SEVERITY_COLOR[severity],
+        fields=tuple(fields),
+        footer=f"Próximo backup: {_next_run_line(run, now)}",
+    )
+
+
+@dataclass(frozen=True)
+class RunAnnouncement:
+    kind: str          # started | finished
+    view: ReportView
+
+
+class RunAnnouncer:
+    """Decide qué anunciar comparando la corrida observada con lo ya anunciado.
+
+    Guarda dos números —el arranque y el fin ya anunciados— y los persiste,
+    porque el Centinela vive en pentium, que **el propio backup enciende y
+    apaga**: entre el "arrancó" y el "terminó" el bot se muere. Sin persistir
+    esos dos números, el aviso de fin no llega nunca o llega de nuevo en cada
+    arranque del bot.
+
+    La primera observación de todas no anuncia un final viejo: sería contar
+    como novedad algo que pasó antes de que existiera este código. Una corrida
+    **en curso** sí se anuncia, porque está pasando ahora.
+    """
+
+    def __init__(self, state=None):
+        state = state or {}
+        self.announced_started = state.get("announced_started")
+        self.announced_finished = state.get("announced_finished")
+        self.seeded = bool(state)
+
+    @staticmethod
+    def _epoch(moment):
+        return None if moment is None else int(moment.timestamp())
+
+    def observe(self, run, now=None):
+        if not run.present:
+            return []
+
+        started = self._epoch(run.started)
+        finished = self._epoch(run.finished)
+        announcements = []
+
+        if not self.seeded:
+            # Adoptar lo que ya había sin anunciarlo, salvo que haya algo vivo.
+            self.seeded = True
+            self.announced_finished = finished
+            if not run.running:
+                self.announced_started = started
+                return []
+
+        if run.running and started and started != self.announced_started:
+            self.announced_started = started
+            announcements.append(RunAnnouncement("started", render_run_started(run, now)))
+
+        if not run.running and finished and finished != self.announced_finished:
+            self.announced_finished = finished
+            # Que no se anuncie después el arranque de una corrida ya terminada.
+            self.announced_started = started
+            announcements.append(RunAnnouncement("finished", render_run_finished(run, now)))
+
+        return announcements
+
+    def dump(self) -> dict:
+        return {
+            "announced_started": self.announced_started,
+            "announced_finished": self.announced_finished,
+        }
 
 
 # ── Estado de alerta ────────────────────────────────────────────────────────

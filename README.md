@@ -105,6 +105,7 @@ cold image renderer; tune it with `GRAFANA_GUARDIAN_START_DELAY_SECONDS`.
 
 ```
 !backups              # the whole backup system, host by host
+!backups next         # when the next run fires, and how the last one went
 !backups <host>       # narrow it to one host
 !backups local        # this host's Borg repo, straight off the filesystem
 !backups arch         # the remote node, through its agent
@@ -131,6 +132,8 @@ backup repo:
 | `backup_canary_age_hours{host,repo}` | repo host, weekly | is the repo healthy but *unwritten* — a dead client timer |
 | `borg_maintenance_*` / `borg_check_*` | repo host | prune and `check --verify-data` recency |
 | `borg_repo_size_bytes` / `borg_repo_archives` / `borg_repo_host_free_bytes` | repo host | growth and headroom |
+| `backup_run_state` / `backup_run_result` / `backup_run_host_state{host}` | orchestrator, per transition | is a run happening **right now**, and how is it going |
+| `backup_next_run_timestamp_seconds` | orchestrator | when the next backup fires |
 
 Two things worth knowing about how it queries:
 
@@ -153,11 +156,29 @@ reading dashboard panels, which a Viewer token can do), so recreating the
 datasource does not break the bot. Pin it with
 `BACKUP_PROMETHEUS_DATASOURCE` if you would rather not discover.
 
-Two loops, on purpose: `watch_backup_fleet` runs hourly and only speaks on a
-**severity transition** (plus a reminder every `BACKUP_ALERT_REMINDER_HOURS`
-while it stays degraded), while `backup_fleet_report` posts the full report
-every `BACKUP_REPORT_EVERY_HOURS` whether or not anything is wrong. A channel
-that only talks when something breaks is indistinguishable from a dead bot.
+Three loops, on purpose:
+
+- `watch_backup_fleet` runs hourly and only speaks on a **severity transition**
+  (plus a reminder every `BACKUP_ALERT_REMINDER_HOURS` while it stays
+  degraded). This is the alarm.
+- `backup_fleet_report` posts the full report every `BACKUP_REPORT_EVERY_HOURS`
+  whether or not anything is wrong. A channel that only talks when something
+  breaks is indistinguishable from a dead bot.
+- `watch_backup_runs` polls every minute and announces **when a backup starts,
+  how it is progressing, and how it ended** — the same shape Updates-Bot uses
+  for the daily update. A fleet backup that takes two hours and is only
+  announced at the end is, while it happens, indistinguishable from one that
+  never started. It costs one instant query per minute (all ten orchestrator
+  series come back in a single `{__name__=~"backup_run_.*"}` selector, and that
+  is also why this one query is *not* wrapped in `last_over_time`: a range
+  function drops the metric name that the grouping needs).
+
+The "started" message is **edited** as hosts complete instead of posting one
+message per host. What has already been announced is persisted to
+`BACKUP_RUN_STATE_PATH`, because this bot runs on the very node the backup
+powers on at 03:00 and powers off when it finishes: between "started" and
+"finished" the process dies. In memory only, the completion notice would either
+never arrive or arrive again on every restart.
 
 With no metrics source configured the command falls back to `BACKUP_PATH`
 exactly as before — the feature is additive.
@@ -418,6 +439,9 @@ See [`.env.example`](./.env.example) for the full list:
 | `BACKUP_PROMETHEUS_DATASOURCE` | Pin the datasource UID instead of discovering it at runtime |
 | `BACKUP_REPORT_EVERY_HOURS` / `BACKUP_REPORT_ALWAYS` | Cadence of the full periodic report, and whether to send it when everything is fine |
 | `BACKUP_ALERT_REMINDER_HOURS` | How often a still-degraded backup is repeated after the first alert |
+| `BACKUP_RUN_ANNOUNCE` | Announce backup runs as they start/progress/finish (default `true`) |
+| `BACKUP_RUN_WATCH_MINUTES` | How often to poll the orchestrator's run state (default `1`) |
+| `BACKUP_RUN_STATE_PATH` | Where the already-announced run is remembered across restarts |
 | `BACKUP_STALE_WARNING_HOURS` / `BACKUP_STALE_CRITICAL_HOURS` | When a backup counts as late (26 h) and as broken (48 h, the alert the backup system was designed around) |
 | `BACKUP_RESTORE_TEST_*_DAYS` / `BACKUP_CANARY_WARNING_HOURS` | Restore-verification and canary freshness thresholds. The 14-day critical is the same number as the backup RUNBOOK's Grafana alert, on purpose |
 | `BACKUP_PRUNE_WARNING_DAYS` / `BACKUP_CHECK_WARNING_DAYS` | Retention and `check --verify-data` recency thresholds |

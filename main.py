@@ -75,6 +75,13 @@ BACKUP_ALERT_REMINDER_H = int(os.getenv('BACKUP_ALERT_REMINDER_HOURS', '12'))
 BACKUP_REPORT_ON_START = os.getenv(
     'BACKUP_REPORT_ON_START', 'true'
 ).lower() in ('true', '1', 'yes')
+# Avisos de corrida: arranco / termino / cuando es el proximo. Se consulta cada
+# minuto porque la pregunta es "¿esta pasando AHORA?"; es una sola consulta
+# instantanea que trae las diez series del orquestador.
+BACKUP_RUN_WATCH_MIN = max(1, int(os.getenv('BACKUP_RUN_WATCH_MINUTES', '1')))
+BACKUP_RUN_ANNOUNCE = os.getenv(
+    'BACKUP_RUN_ANNOUNCE', 'true'
+).lower() in ('true', '1', 'yes')
 BACKUP_POLICY = backup_monitor.BackupPolicy.from_env()
 SAFE_SUBNETS = [s.strip() for s in os.getenv('SAFE_SUBNETS', '192.168.,10.,172.').split(',')]
 SERVER_NAME = os.getenv('SERVER_NAME', 'Server')
@@ -162,6 +169,9 @@ _STATE_DIR = (
 )
 SSH_BASELINE_PATH = os.getenv(
     'SSH_BASELINE_PATH', os.path.join(_STATE_DIR, 'ssh-baseline.json')
+)
+BACKUP_RUN_STATE_PATH = os.getenv(
+    'BACKUP_RUN_STATE_PATH', os.path.join(_STATE_DIR, 'backup-run.json')
 )
 SSH_ANOMALY_ENABLED = os.getenv(
     'SSH_ANOMALY_ENABLED', 'true'
@@ -926,6 +936,10 @@ backup_alert_state = backup_monitor.AlertState(
 local_backup_alert = backup_monitor.AlertState(
     reminder=timedelta(hours=BACKUP_ALERT_REMINDER_H)
 )
+# Mensaje del aviso de "backup en curso", para editarlo con el avance en vez de
+# postear uno nuevo por host. Solo dura lo que dure el proceso: si el bot se
+# reinicia a mitad de corrida, el proximo aviso es un mensaje nuevo y listo.
+backup_run_message = None
 
 
 def backup_fleet_configured():
@@ -988,6 +1002,58 @@ def embed_from_view(view, timestamp=None):
 async def fetch_backup_report():
     source = await get_backup_source()
     return await backup_monitor.collect_report(source, BACKUP_POLICY)
+
+
+async def fetch_backup_run():
+    source = await get_backup_source()
+    return await backup_monitor.collect_run_status(source)
+
+
+def load_backup_run_state():
+    """Lo ultimo que se anuncio de una corrida, de la sesion anterior.
+
+    Persiste porque el Centinela vive en pentium, que el propio backup enciende
+    a las 03:00 y apaga al terminar: entre el "arranco" y el "termino" este
+    proceso se muere. En memoria, el aviso de fin no llegaria nunca — o llegaria
+    de nuevo en cada arranque del bot.
+    """
+    try:
+        with open(BACKUP_RUN_STATE_PATH, encoding='utf-8') as handle:
+            state = json.load(handle)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_backup_run_state(state):
+    directory = os.path.dirname(BACKUP_RUN_STATE_PATH) or '.'
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        tmp = f"{BACKUP_RUN_STATE_PATH}.tmp"
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            json.dump(state, handle, separators=(',', ':'))
+        os.replace(tmp, BACKUP_RUN_STATE_PATH)
+    except OSError as error:
+        if DEBUG_MODE:
+            print(f"No pude guardar el estado de la corrida: {error}", file=sys.stderr)
+
+
+backup_run_announcer = backup_monitor.RunAnnouncer(load_backup_run_state())
+
+
+async def _backup_run_or_none():
+    """Estado de la corrida, o None si no se puede leer.
+
+    El reporte de flota no depende de esto: si el orquestador no responde, el
+    reporte sale igual sin la seccion de la corrida. Un dato de mas no puede
+    tumbar el reporte entero.
+    """
+    try:
+        return await fetch_backup_run()
+    except backup_monitor.BackupMonitorError as error:
+        if DEBUG_MODE:
+            print(f"Estado de la corrida: {error}", file=sys.stderr)
+        return None
 
 
 async def local_backup_view():
@@ -2020,7 +2086,7 @@ async def on_ready():
     if BACKUP_PATH and not watch_backups.is_running():
         watch_backups.start()
     if backup_fleet_configured():
-        for task in [watch_backup_fleet, backup_fleet_report]:
+        for task in [watch_backup_fleet, backup_fleet_report, watch_backup_runs]:
             if not task.is_running():
                 task.start()
     if WATCHED_SERVICES and not watch_services.is_running():
@@ -2889,8 +2955,54 @@ async def watch_backup_fleet():
     backup_source_failed = False
     if backup_alert_state.should_notify(report.severity):
         await channel.send(embed=embed_from_view(
-            backup_monitor.render_fleet(report), timestamp=report.generated_at
+            backup_monitor.render_fleet(report, run=await _backup_run_or_none()),
+            timestamp=report.generated_at,
         ))
+
+
+@tasks.loop(minutes=BACKUP_RUN_WATCH_MIN)
+async def watch_backup_runs():
+    """Avisa cuando un backup arranca, cuando termina y cuando es el proximo.
+
+    Es lo mismo que hace el Updates-Bot con el update diario: un mensaje al
+    empezar que se va editando con el avance, y el resultado al final. Un
+    backup de la flota que dura dos horas y solo se anuncia al terminar es
+    indistinguible, mientras pasa, de uno que no arranco nunca.
+    """
+    global backup_run_message
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or not backup_fleet_configured() or not BACKUP_RUN_ANNOUNCE:
+        return
+    try:
+        run = await fetch_backup_run()
+    except backup_monitor.BackupMonitorError as error:
+        # Silencioso a proposito: quien avisa que no se puede leer el estado de
+        # los backups es watch_backup_fleet, y una vez sola. Este loop corre
+        # cada minuto; si tambien avisara serian 60 mensajes por hora.
+        if DEBUG_MODE:
+            print(f"Backup run watcher: {error}", file=sys.stderr)
+        return
+
+    for announcement in backup_run_announcer.observe(run):
+        embed = embed_from_view(announcement.view, timestamp=datetime.now())
+        if announcement.kind == 'started':
+            backup_run_message = await channel.send(embed=embed)
+        else:
+            await channel.send(embed=embed)
+            backup_run_message = None
+        save_backup_run_state(backup_run_announcer.dump())
+
+    # Avance: se edita el mensaje del arranque en vez de postear uno por host.
+    if run.running and backup_run_message is not None:
+        try:
+            await backup_run_message.edit(embed=embed_from_view(
+                backup_monitor.render_run_progress(run), timestamp=datetime.now()
+            ))
+        except discord.HTTPException as error:
+            # El mensaje pudo borrarse. No vale la pena romper el loop por eso.
+            if DEBUG_MODE:
+                print(f"No pude editar el aviso de backup: {error}", file=sys.stderr)
+            backup_run_message = None
 
 
 @tasks.loop(hours=max(1, BACKUP_REPORT_EVERY_H))
@@ -2915,7 +3027,8 @@ async def backup_fleet_report():
             print(f"Backup fleet report: {error}", file=sys.stderr)
         return
     await channel.send(embed=embed_from_view(
-        backup_monitor.render_fleet(report), timestamp=report.generated_at
+        backup_monitor.render_fleet(report, run=await _backup_run_or_none()),
+        timestamp=report.generated_at,
     ))
 
 @tasks.loop(hours=6)
@@ -3461,12 +3574,35 @@ async def check_backups(ctx, target: str = None):
     """Estado de los backups.
 
     `!backups`          → la flota entera (o el repo local si no hay métricas)
+    `!backups next`     → cuándo es el próximo backup y cómo salió el último
     `!backups local`    → el repo Borg de este host
     `!backups arch`     → el nodo remoto, vía su agente
     `!backups <host>`   → filtra el reporte de flota por host
     """
     if _is_remote_alias(target):
         return await _remote_backups_command(ctx)
+
+    if (target or "").strip().lower() in ("next", "proximo", "próximo", "run"):
+        if not backup_fleet_configured():
+            return await ctx.send(
+                "❌ No hay fuente de métricas configurada. Ver `BACKUP_PROMETHEUS_URL` "
+                "en el README."
+            )
+        try:
+            run = await fetch_backup_run()
+        except backup_monitor.BackupMonitorError as error:
+            return await ctx.send(f"❌ {str(error)[:1900]}")
+        if not run.present:
+            return await ctx.send(
+                "⚪ El orquestador de backups no está reportando. O todavía no se "
+                "desplegó, o su `.prom` no está llegando a Prometheus."
+            )
+        view = (
+            backup_monitor.render_run_progress(run)
+            if run.running
+            else backup_monitor.render_run_finished(run)
+        )
+        return await ctx.send(embed=embed_from_view(view, timestamp=datetime.now()))
 
     wants_local = (target or "").strip().lower() in ("local", "host", "aca", "acá")
     if wants_local or not backup_fleet_configured():
@@ -3482,7 +3618,8 @@ async def check_backups(ctx, target: str = None):
         report = await fetch_backup_report()
     except backup_monitor.BackupMonitorError as error:
         return await msg.edit(content=f"❌ {str(error)[:1900]}")
-    view = backup_monitor.render_fleet(report, host_filter=target)
+    run = await _backup_run_or_none()
+    view = backup_monitor.render_fleet(report, host_filter=target, run=run)
     await msg.edit(content=None, embed=embed_from_view(view, timestamp=report.generated_at))
 
 # ==========================================

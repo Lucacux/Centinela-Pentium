@@ -473,6 +473,232 @@ class LocalRepoTests(unittest.TestCase):
         self.assertFalse(bm.local_status_from_payload(None).configured)
 
 
+def run_samples(*, state=0, started=None, finished=None, duration=None,
+                result=None, next_run=None, hosts=()):
+    """Muestras del orquestador, tal como llegarían de una consulta con __name__."""
+    def named(metric, value, labels=None):
+        return bm.Sample({"__name__": metric, **(labels or {})}, value)
+
+    samples = [named(bm.M_RUN_STATE, state)]
+    if started is not None:
+        samples.append(named(bm.M_RUN_STARTED, started))
+    if finished is not None:
+        samples.append(named(bm.M_RUN_FINISHED, finished))
+    if duration is not None:
+        samples.append(named(bm.M_RUN_DURATION, duration))
+    if result is not None:
+        samples.append(named(bm.M_RUN_RESULT, result))
+    if next_run is not None:
+        samples.append(named(bm.M_NEXT_RUN, next_run))
+    for host, host_state, woken in hosts:
+        samples.append(named(bm.M_RUN_HOST_STATE, host_state, {"host": host}))
+        samples.append(named(bm.M_RUN_HOST_WOKEN, 1 if woken else 0, {"host": host}))
+    return samples
+
+
+def run_status(**kwargs):
+    return bm.build_run_status(bm.group_by_metric_name(run_samples(**kwargs)))
+
+
+class RunStatusTests(unittest.TestCase):
+    def test_no_metrics_means_not_present(self):
+        status = bm.build_run_status({})
+        self.assertFalse(status.present)
+        self.assertEqual(status.severity, NO_DATA)
+
+    def test_reads_a_run_in_progress(self):
+        status = run_status(
+            state=1,
+            started=epoch(timedelta(minutes=20)),
+            hosts=[("pentium", bm.HOST_OK, True), ("sempron", bm.HOST_RUNNING, True)],
+        )
+        self.assertTrue(status.running)
+        self.assertEqual(status.current_host, "sempron")
+        self.assertEqual(status.woken_hosts, ("sempron", "pentium"))
+
+    def test_running_host_comes_first(self):
+        """El reporte se lee en el celular: lo que está pasando va arriba."""
+        status = run_status(
+            state=1,
+            hosts=[
+                ("a-ok", bm.HOST_OK, False),
+                ("z-corriendo", bm.HOST_RUNNING, False),
+                ("m-fallo", bm.HOST_FAILED, False),
+            ],
+        )
+        self.assertEqual(
+            [host.name for host in status.hosts], ["z-corriendo", "m-fallo", "a-ok"]
+        )
+
+    def test_counts_distinguish_failed_from_skipped(self):
+        """Omitido no es fallado: el nodo no encendió, el backup no se rompió."""
+        status = run_status(
+            state=0,
+            result=bm.RESULT_PARTIAL,
+            hosts=[
+                ("uno", bm.HOST_OK, False),
+                ("dos", bm.HOST_FAILED, False),
+                ("tres", bm.HOST_SKIPPED, True),
+            ],
+        )
+        self.assertEqual(
+            status.counts(), {"total": 3, "ok": 1, "failed": 1, "skipped": 1}
+        )
+        self.assertEqual(status.severity, WARNING)
+
+    def test_result_maps_to_severity(self):
+        self.assertEqual(run_status(result=bm.RESULT_OK).severity, OK)
+        self.assertEqual(run_status(result=bm.RESULT_FAILED).severity, CRITICAL)
+
+    def test_a_run_in_progress_is_not_an_alarm(self):
+        self.assertEqual(run_status(state=1, result=bm.RESULT_FAILED).severity, OK)
+
+    def test_zero_timestamp_means_never_not_1970(self):
+        status = run_status(state=0, finished=0)
+        self.assertIsNone(status.finished)
+
+
+class CollectRunStatusTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_a_single_query(self):
+        """Este poll corre cada minuto: once consultas por minuto serían 15 mil
+        por día para contestar una pregunta que entra en una."""
+        source = FakeSource({"backup_run_": run_samples(state=1)})
+        status = await bm.collect_run_status(source)
+        self.assertEqual(len(source.queries), 1)
+        self.assertTrue(status.running)
+
+    async def test_does_not_wrap_in_last_over_time(self):
+        """A diferencia del reporte de flota: acá el nombre de la métrica tiene
+        que sobrevivir para poder agrupar, y una función de rango lo borra."""
+        source = FakeSource({"backup_run_": run_samples()})
+        await bm.collect_run_status(source)
+        self.assertNotIn("last_over_time", source.queries[0])
+        self.assertIn("__name__", source.queries[0])
+
+
+class RunAnnouncerTests(unittest.TestCase):
+    def test_first_observation_of_an_old_run_says_nothing(self):
+        """Contar como novedad algo que pasó antes de que existiera este código
+        es lo mismo que saludar en cada reinicio."""
+        announcer = bm.RunAnnouncer()
+        status = run_status(
+            state=0, started=epoch(timedelta(hours=6)),
+            finished=epoch(timedelta(hours=5)), result=bm.RESULT_OK,
+        )
+        self.assertEqual(announcer.observe(status), [])
+
+    def test_first_observation_of_a_live_run_does_announce(self):
+        announcer = bm.RunAnnouncer()
+        status = run_status(state=1, started=epoch(timedelta(minutes=3)))
+        kinds = [a.kind for a in announcer.observe(status)]
+        self.assertEqual(kinds, ["started"])
+
+    def test_start_then_finish(self):
+        announcer = bm.RunAnnouncer({"announced_finished": 0})
+        started_at = epoch(timedelta(minutes=30))
+        running = run_status(state=1, started=started_at)
+        self.assertEqual([a.kind for a in announcer.observe(running)], ["started"])
+        # Mientras siga corriendo no repite el aviso.
+        self.assertEqual(announcer.observe(running), [])
+
+        done = run_status(
+            state=0, started=started_at, finished=epoch(timedelta(minutes=1)),
+            result=bm.RESULT_OK, duration=1740,
+        )
+        self.assertEqual([a.kind for a in announcer.observe(done)], ["finished"])
+        self.assertEqual(announcer.observe(done), [])
+
+    def test_finish_is_announced_after_a_restart_mid_run(self):
+        """El caso real: el backup enciende pentium, el Centinela anuncia el
+        arranque, el backup termina y apaga pentium antes de que el bot lo vea.
+        Al volver, el aviso de fin tiene que salir igual."""
+        started_at = epoch(timedelta(hours=4))
+        announcer = bm.RunAnnouncer({
+            "announced_started": int(started_at),
+            "announced_finished": int(epoch(timedelta(days=1))),
+        })
+        done = run_status(
+            state=0, started=started_at, finished=epoch(timedelta(hours=3)),
+            result=bm.RESULT_OK,
+        )
+        self.assertEqual([a.kind for a in announcer.observe(done)], ["finished"])
+
+    def test_a_finished_run_never_announces_its_start_afterwards(self):
+        announcer = bm.RunAnnouncer({"announced_finished": 0})
+        started_at = epoch(timedelta(hours=2))
+        done = run_status(
+            state=0, started=started_at, finished=epoch(timedelta(hours=1)),
+            result=bm.RESULT_OK,
+        )
+        announcer.observe(done)
+        # Si volviera a verse la misma corrida, no hay nada nuevo que contar.
+        self.assertEqual(announcer.observe(done), [])
+
+    def test_state_survives_a_round_trip(self):
+        announcer = bm.RunAnnouncer({"announced_finished": 0})
+        announcer.observe(run_status(state=1, started=epoch(timedelta(minutes=5))))
+        revived = bm.RunAnnouncer(announcer.dump())
+        self.assertEqual(revived.observe(
+            run_status(state=1, started=epoch(timedelta(minutes=5)))
+        ), [])
+
+    def test_absent_metrics_announce_nothing(self):
+        announcer = bm.RunAnnouncer()
+        self.assertEqual(announcer.observe(bm.build_run_status({})), [])
+
+
+class RenderRunTests(unittest.TestCase):
+    def test_started_view_mentions_wol_and_next_run(self):
+        status = run_status(
+            state=1, started=epoch(timedelta(minutes=5)),
+            next_run=(NOW + timedelta(hours=20)).timestamp(),
+            hosts=[("sempron", bm.HOST_RUNNING, True)],
+        )
+        view = bm.render_run_started(status, NOW)
+        self.assertIn("en curso", view.title)
+        self.assertIn("sempron", " ".join(f.value for f in view.fields))
+        self.assertIn("Próximo backup", view.footer)
+
+    def test_progress_view_names_the_host_being_backed_up(self):
+        status = run_status(state=1, hosts=[("pentium", bm.HOST_RUNNING, False)])
+        self.assertIn("pentium", bm.render_run_progress(status, NOW).description)
+
+    def test_finished_view_reports_partial_as_a_warning(self):
+        status = run_status(
+            state=0, result=bm.RESULT_PARTIAL, duration=900,
+            finished=epoch(timedelta(minutes=2)),
+            hosts=[("uno", bm.HOST_OK, False), ("dos", bm.HOST_SKIPPED, False)],
+        )
+        view = bm.render_run_finished(status, NOW)
+        self.assertEqual(view.color, bm.SEVERITY_COLOR[WARNING])
+        self.assertIn("1/2 ok", " ".join(f.value for f in view.fields))
+        self.assertIn("1 omitidos", " ".join(f.value for f in view.fields))
+
+    def test_finished_view_without_a_timer_says_so(self):
+        view = bm.render_run_finished(run_status(state=0, result=bm.RESULT_OK), NOW)
+        self.assertIn("sin timer", view.footer)
+
+    def test_fleet_report_carries_the_next_run(self):
+        report = bm.build_report(
+            {bm.M_LAST_SUCCESS: [sample("sempron", "mbp", epoch(timedelta(hours=2)))]},
+            POLICY, NOW,
+        )
+        status = run_status(
+            state=0, result=bm.RESULT_OK,
+            next_run=(NOW + timedelta(hours=18)).timestamp(),
+        )
+        view = bm.render_fleet(report, run=status)
+        self.assertIn("Próximo backup", " ".join(f.value for f in view.fields))
+
+    def test_fleet_report_without_run_metrics_is_unchanged(self):
+        report = bm.build_report(
+            {bm.M_LAST_SUCCESS: [sample("sempron", "mbp", epoch(timedelta(hours=2)))]},
+            POLICY, NOW,
+        )
+        names = [f.name for f in bm.render_fleet(report, run=None).fields]
+        self.assertNotIn("🗓 La corrida", names)
+
+
 class AlertStateTests(unittest.TestCase):
     def test_stays_quiet_when_everything_is_fine_at_boot(self):
         state = bm.AlertState()
