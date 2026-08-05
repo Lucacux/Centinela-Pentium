@@ -175,9 +175,12 @@ class BackupPolicy:
     """Umbrales del reporte. Todo configurable: los timers son del usuario.
 
     Los defaults salen de los `OnCalendar` de homelab-backup: backup diario
-    03:00 (+15 min de jitter), prune semanal, restore-test semanal, check
+    08:00 (+15 min de jitter), prune semanal, restore-test semanal, check
     mensual. El margen extra es para que un host que se enciende tarde no
     dispare rojo en el primer minuto.
+
+    Los umbrales son en horas transcurridas, no horarios: mover la ventana del
+    backup (pasó de 03:00 a 08:00 el 2026-08-04) no los invalida.
 
     Los tres umbrales críticos son, a propósito, los mismos que las alertas de
     Grafana que define el RUNBOOK del repo de backups (48 h sin backup, 14 d

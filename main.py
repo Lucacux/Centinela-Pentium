@@ -1012,10 +1012,14 @@ async def fetch_backup_run():
 def load_backup_run_state():
     """Lo ultimo que se anuncio de una corrida, de la sesion anterior.
 
-    Persiste porque el Centinela vive en pentium, que el propio backup enciende
-    a las 03:00 y apaga al terminar: entre el "arranco" y el "termino" este
-    proceso se muere. En memoria, el aviso de fin no llegaria nunca — o llegaria
-    de nuevo en cada arranque del bot.
+    Persiste porque el Centinela vive en pentium, que no esta 24/7: si el bot se
+    muere entre el "arranco" y el "termino" de una corrida, en memoria el aviso
+    de fin no llegaria nunca — o llegaria de nuevo en cada arranque del bot.
+
+    Con la ventana en 08:00 pentium ya esta dentro de su franja (07:00-23:00) y
+    el backup no lo apaga, asi que el caso es menos frecuente que cuando el
+    backup era a las 03:00 y lo prendia el. Menos frecuente no es imposible: el
+    deploy reinicia el bot, y la franja del WOL-Bot la cambia quien quiera.
     """
     try:
         with open(BACKUP_RUN_STATE_PATH, encoding='utf-8') as handle:
