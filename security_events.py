@@ -14,17 +14,43 @@ from urllib.parse import urlsplit
 import aiohttp
 
 
+# El sufijo de clave (`ssh2: ED25519 SHA256:...`) lo emite sshd con LogLevel
+# INFO, sin necesidad de VERBOSE. Es la unica pista en el log que distingue
+# "entro Luca" de "entro el bot de Ansible" cuando ambos usan el mismo usuario
+# Unix: el usuario y la IP de origen son identicos, el fingerprint no.
+_SSH_KEY_SUFFIX = (
+    r"(?:\s+ssh\d*:\s*(?P<key_type>[A-Za-z0-9-]+)\s+"
+    r"(?P<fingerprint>(?:SHA256|MD5):\S+))?"
+)
 _SSH_LOGIN_RE = re.compile(
     r"\bAccepted\s+(?P<method>\S+)\s+for\s+(?P<user>\S+)\s+"
     r"from\s+(?P<ip>[0-9a-fA-F:.]+)\s+port\s+(?P<port>\d+)"
+    + _SSH_KEY_SUFFIX
 )
 _SSH_FAIL_RE = re.compile(
-    r"\bFailed\s+\S+\s+for\s+(?:invalid user\s+)?(?P<user>\S+)\s+"
+    r"\bFailed\s+(?P<method>\S+)\s+for\s+(?P<invalid>invalid user\s+)?"
+    r"(?P<user>\S+)\s+"
     r"from\s+(?P<ip>[0-9a-fA-F:.]+)(?:\s+port\s+(?P<port>\d+))?"
+    + _SSH_KEY_SUFFIX
 )
 _SSH_PAM_FAIL_RE = re.compile(
     r"\bauthentication failure;.*\brhost=(?P<ip>[0-9a-fA-F:.]+)"
     r"(?:\s+user=(?P<user>\S+))?"
+)
+# sshd emite "Invalid user X from IP port N" ANTES de cualquier intento de
+# credencial, asi que un escaneo de usuarios nunca produce un "Failed ...".
+# Sin esta linea, enumerar cuentas es invisible para el bot.
+_SSH_INVALID_USER_RE = re.compile(
+    r"\bInvalid user\s+(?P<user>\S*)\s+from\s+(?P<ip>[0-9a-fA-F:.]+)"
+    r"(?:\s+port\s+(?P<port>\d+))?"
+)
+# Cliente que negocia y se va sin autenticar: el patron tipico de un scanner.
+_SSH_PREAUTH_RE = re.compile(
+    r"\b(?:Connection closed|Connection reset|Disconnected)\s+"
+    r"(?:by|from)\s+(?:authenticating user\s+(?P<user>\S+)\s+)?"
+    r"(?P<invalid>invalid user\s+(?P<invalid_user>\S+)\s+)?"
+    r"(?P<ip>[0-9a-fA-F:.]+)(?:\s+port\s+(?P<port>\d+))?"
+    r".*\[preauth\]"
 )
 _JAILS_RE = re.compile(r"Jail list:\s*(?P<jails>.*)$", re.MULTILINE)
 _BANNED_RE = re.compile(r"Banned IP list:\s*(?P<ips>.*)$", re.MULTILINE)
@@ -108,14 +134,53 @@ def classify_ssh_origin(observed_ip, effective_ip, safe_subnets, correlated=Fals
     }
 
 
+def _normalize_fingerprint(value):
+    """``SHA256:abc`` and a bare ``abc`` must hash to the same directory key."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.split(" ", 1)[0]
+
+
 def parse_ssh_line(line):
-    """Return a normalized SSH event dict, or ``None`` for unrelated lines."""
+    """Return a normalized SSH event dict, or ``None`` for unrelated lines.
+
+    Every returned event carries ``fingerprint`` and ``method`` (possibly
+    empty) so callers never have to branch on which regex matched.
+    """
     match = _SSH_LOGIN_RE.search(line)
     if match:
-        return {"kind": "ssh_login", **match.groupdict()}
+        values = match.groupdict()
+        return {
+            "kind": "ssh_login",
+            "invalid_user": False,
+            **values,
+            "fingerprint": _normalize_fingerprint(values.get("fingerprint")),
+        }
     match = _SSH_FAIL_RE.search(line)
     if match:
-        return {"kind": "ssh_fail", **match.groupdict()}
+        values = match.groupdict()
+        invalid = bool(values.pop("invalid", None))
+        return {
+            "kind": "ssh_fail",
+            **values,
+            "invalid_user": invalid,
+            "fingerprint": _normalize_fingerprint(values.get("fingerprint")),
+        }
+    match = _SSH_INVALID_USER_RE.search(line)
+    if match:
+        values = match.groupdict()
+        return {
+            "kind": "ssh_fail",
+            "user": values.get("user") or "desconocido",
+            "ip": values["ip"],
+            "port": values.get("port"),
+            "method": "none",
+            "key_type": None,
+            "fingerprint": "",
+            "invalid_user": True,
+            "probe": True,
+        }
     match = _SSH_PAM_FAIL_RE.search(line)
     if match:
         values = match.groupdict()
@@ -124,8 +189,157 @@ def parse_ssh_line(line):
             "user": values.get("user") or "desconocido",
             "ip": values["ip"],
             "port": None,
+            "method": "password",
+            "key_type": None,
+            "fingerprint": "",
+            "invalid_user": False,
+        }
+    match = _SSH_PREAUTH_RE.search(line)
+    if match:
+        values = match.groupdict()
+        user = values.get("user") or values.get("invalid_user") or "desconocido"
+        return {
+            "kind": "ssh_fail",
+            "user": user,
+            "ip": values["ip"],
+            "port": values.get("port"),
+            "method": "none",
+            "key_type": None,
+            "fingerprint": "",
+            "invalid_user": bool(values.get("invalid")),
+            "probe": True,
         }
     return None
+
+
+_SSH_KEYGEN_RE = re.compile(
+    r"^\s*(?P<bits>\d+)\s+(?P<fingerprint>(?:SHA256|MD5):\S+)\s+"
+    r"(?P<comment>.*?)\s+\((?P<key_type>[A-Za-z0-9-]+)\)\s*$"
+)
+
+
+def parse_ssh_keygen_fingerprints(output):
+    """Parse ``ssh-keygen -lf authorized_keys`` into fingerprint records.
+
+    ``ssh-keygen`` prints ``no comment`` when a key has none; that string is
+    not an identity and would otherwise become a label.
+    """
+    entries = []
+    for line in str(output or "").splitlines():
+        match = _SSH_KEYGEN_RE.match(line)
+        if not match:
+            continue
+        values = match.groupdict()
+        comment = values["comment"].strip()
+        entries.append({
+            "fingerprint": values["fingerprint"],
+            "comment": "" if comment == "no comment" else comment,
+            "key_type": values["key_type"],
+            "bits": int(values["bits"]),
+        })
+    return entries
+
+
+class SshKeyDirectory:
+    """Maps an SSH fingerprint to a human identity.
+
+    Two sources, in order of precedence: explicit labels (from configuration)
+    and the comment field of ``authorized_keys``.  The comment is a good
+    default because it is already maintained by whoever installs the key, but
+    it is not authoritative -- several keys in this fleet share the comment
+    ``luca@archlinux`` while belonging to different automations, which is
+    exactly what the explicit labels are for.
+
+    A fingerprint that is absent from every ``authorized_keys`` is the signal
+    that matters most: sshd accepted a key nobody can account for.
+    """
+
+    def __init__(self, labels=None):
+        self._labels = {
+            _normalize_fingerprint(key): str(value)
+            for key, value in (labels or {}).items()
+            if _normalize_fingerprint(key) and value
+        }
+        self._entries = {}
+        self._users = {}
+        self.covered_users = set()
+        self.updated_at = None
+
+    def load(self, entries, covered_users=(), now=None):
+        """Index fingerprints and remember whose keyrings could be read.
+
+        ``covered_users`` is not cosmetic: the agent runs unprivileged and may
+        be unable to read ``/root/.ssh/authorized_keys``.  Without that set, a
+        legitimate root login would be reported as an unrecognized key on every
+        single connection, and an alert that cries wolf nightly gets muted.
+        """
+        self._entries = {}
+        self._users = {}
+        for entry in entries or ():
+            key = _normalize_fingerprint(entry.get("fingerprint"))
+            if not key:
+                continue
+            self._entries.setdefault(key, entry)
+            user = str(entry.get("user") or "")
+            if user:
+                self._users.setdefault(key, set()).add(user)
+        self.covered_users = {str(user) for user in covered_users if user}
+        self.updated_at = parse_timestamp(now)
+        return self
+
+    def __len__(self):
+        return len(self._entries)
+
+    @property
+    def loaded(self):
+        return self.updated_at is not None
+
+    def covers(self, user):
+        """True when this user's keyring was actually read."""
+        return str(user or "") in self.covered_users
+
+    def is_authorized(self, fingerprint):
+        """False also when the directory is empty: unknown is not authorized.
+
+        Callers must consult :attr:`loaded` to tell "no key is authorized" from
+        "the directory was never loaded"; treating an unloaded directory as
+        permissive would silence the one alert worth having.
+        """
+        return _normalize_fingerprint(fingerprint) in self._entries
+
+    def authorized_users(self, fingerprint):
+        """Unix accounts whose ``authorized_keys`` list this fingerprint."""
+        return set(self._users.get(_normalize_fingerprint(fingerprint), ()))
+
+    def items(self):
+        """``(fingerprint, entry)`` pairs, ordered by the owning account."""
+        return sorted(
+            self._entries.items(),
+            key=lambda item: (
+                sorted(self.authorized_users(item[0])),
+                item[1].get("comment", ""),
+            ),
+        )
+
+    def describe(self, fingerprint):
+        """Return ``(label, known)`` for a fingerprint."""
+        key = _normalize_fingerprint(fingerprint)
+        if not key:
+            return "", False
+        if key in self._labels:
+            return self._labels[key], True
+        entry = self._entries.get(key)
+        if entry is None:
+            return "", False
+        return entry.get("comment") or "clave sin comentario", True
+
+    def short(self, fingerprint):
+        """Fingerprint trimmed for an embed; the full value stays in the log."""
+        key = _normalize_fingerprint(fingerprint)
+        if not key:
+            return ""
+        body = key.split(":", 1)[1] if ":" in key else key
+        return body[:12]
 
 
 def parse_fail2ban_jails(output):

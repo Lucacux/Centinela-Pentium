@@ -97,6 +97,92 @@ Critical findings — which trains you to ignore the colour red.
 
 `<dashboard>` matches by uid or by a substring of the title; `<panel>` by id or title substring. Enable it by setting `GRAFANA_URL` and `GRAFANA_TOKEN` (a Grafana service-account token, Viewer role is enough) in `.env`.
 
+The periodic Guardian report waits five minutes after a bot restart before its
+first Fleet Overview render.  This prevents deployments from competing with a
+cold image renderer; tune it with `GRAFANA_GUARDIAN_START_DELAY_SECONDS`.
+
+### 💾 Fleet backups
+
+```
+!backups              # the whole backup system, host by host
+!backups next         # when the next run fires, and how the last one went
+!backups <host>       # narrow it to one host
+!backups local        # this host's Borg repo, straight off the filesystem
+!backups arch         # the remote node, through its agent
+```
+
+State is read from the **metrics the backup system already publishes**
+(`homelab-backup`: Ansible + Borg 1.x + borgmatic, append-only), not by
+SSH-ing into every host. One credential instead of N, it still answers when a
+host is powered off, and it does not open a second privileged path into the
+fleet.
+
+**Nothing about the fleet is hardcoded.** There is no list of hosts, repos or
+tenants anywhere in `backup_monitor.py`: every row in the report comes from
+the labels of the series. A host that joins the backup system shows up on its
+own. The only fixed thing is the metric names, which are the contract with the
+backup repo:
+
+| Metric | Written by | Answers |
+|---|---|---|
+| `backup_last_success_timestamp_seconds{host,repo}` | client, per run | how old is the newest good backup |
+| `backup_last_exit_code{host,repo}` | client, per run | did the last attempt fail (even if an older one succeeded) |
+| `backup_last_duration_seconds` / `backup_repo_size_bytes` | client, per run | how long it took, how much it holds |
+| `backup_restore_test_last_success_timestamp_seconds{host,repo}` | repo host, weekly | was a restore actually verified |
+| `backup_canary_age_hours{host,repo}` | repo host, weekly | is the repo healthy but *unwritten* — a dead client timer |
+| `borg_maintenance_*` / `borg_check_*` | repo host | prune and `check --verify-data` recency |
+| `borg_repo_size_bytes` / `borg_repo_archives` / `borg_repo_host_free_bytes` | repo host | growth and headroom |
+| `backup_run_state` / `backup_run_result` / `backup_run_host_state{host}` | orchestrator, per transition | is a run happening **right now**, and how is it going |
+| `backup_next_run_timestamp_seconds` | orchestrator | when the next backup fires |
+
+Two things worth knowing about how it queries:
+
+- Every metric is wrapped in `last_over_time(<metric>[14d])`. Prometheus drops
+  a series ~5 min after its exporter stops answering, so a plain query makes a
+  host whose `node_exporter` died **disappear** from the report — the one
+  failure mode you most want to see. The lookback keeps it visible, in red,
+  with its last known value.
+- `0` means *never*, not 1970. The backup scripts write `0` when there has
+  never been a successful run, and preserve the previous timestamp when an
+  attempt fails; the report reads both the same way the scripts write them.
+
+**Reaching Prometheus.** Set `BACKUP_PROMETHEUS_URL` if the bot can hit it
+directly. If not — the usual case, since Prometheus tends to be firewalled
+while Grafana is open — leave it empty and the queries go through **Grafana's
+datasource proxy**, reusing the `GRAFANA_URL` / `GRAFANA_TOKEN` that
+`!grafana` already needs. No new credential, no new firewall rule. The
+datasource UID is discovered at runtime (`/api/datasources`, falling back to
+reading dashboard panels, which a Viewer token can do), so recreating the
+datasource does not break the bot. Pin it with
+`BACKUP_PROMETHEUS_DATASOURCE` if you would rather not discover.
+
+Three loops, on purpose:
+
+- `watch_backup_fleet` runs hourly and only speaks on a **severity transition**
+  (plus a reminder every `BACKUP_ALERT_REMINDER_HOURS` while it stays
+  degraded). This is the alarm.
+- `backup_fleet_report` posts the full report every `BACKUP_REPORT_EVERY_HOURS`
+  whether or not anything is wrong. A channel that only talks when something
+  breaks is indistinguishable from a dead bot.
+- `watch_backup_runs` polls every minute and announces **when a backup starts,
+  how it is progressing, and how it ended** — the same shape Updates-Bot uses
+  for the daily update. A fleet backup that takes two hours and is only
+  announced at the end is, while it happens, indistinguishable from one that
+  never started. It costs one instant query per minute (all ten orchestrator
+  series come back in a single `{__name__=~"backup_run_.*"}` selector, and that
+  is also why this one query is *not* wrapped in `last_over_time`: a range
+  function drops the metric name that the grouping needs).
+
+The "started" message is **edited** as hosts complete instead of posting one
+message per host. What has already been announced is persisted to
+`BACKUP_RUN_STATE_PATH`, because this bot runs on the very node the backup
+powers on at 03:00 and powers off when it finishes: between "started" and
+"finished" the process dies. In memory only, the completion notice would either
+never arrive or arrive again on every restart.
+
+With no metrics source configured the command falls back to `BACKUP_PATH`
+exactly as before — the feature is additive.
+
 ### 🌐 Network diagnostics
 
 `!red` (aliases `!net`, `!diag`) replaces the old boolean "internet is down" check
@@ -176,6 +262,62 @@ the one-minute loop, so each reading is a true one-minute average and alerts rea
 warm data without sleeping or blocking the event loop. CPU is normalised by core
 count (psutil reports up to `100 * ncores`, i.e. 200% on the E5400).
 
+**On the remote node** the same guarantee needs a different mechanism: the agent
+is a one-shot process per SSH connection, so every `cpu_percent()` there would be
+a first call and return `0.0`. It keeps the cumulative CPU times of the previous
+poll in a small state file under `/run` and reports the delta, which makes each
+reading a true average over the polling interval without sleeping inside the
+agent. The top consumers travel *inside* `snapshot`, not as a second request
+after an alarm fires — the culprit has to be the one measured during the breach,
+not whatever the machine is doing once it has calmed down. Processes owned by a
+container are reported by container name rather than by `python3`.
+
+### 🔐 SSH key identity
+
+sshd writes the fingerprint of the accepted key on every login at `LogLevel INFO`
+(`Accepted publickey for luca from 192.168.2.40 port 55160 ssh2: ED25519
+SHA256:...`); `VERBOSE` is not required. That fingerprint is the only thing in
+the log that separates two automations sharing one Unix account — the user and
+the source IP are identical, the key is not.
+
+Fingerprints are resolved to names through the `authorized_keys` of the node:
+the agent publishes `ssh-keygen -lf` output (fingerprints and comments only, no
+key material), and `SSH_KEY_LABELS` overrides the comment where it is not
+descriptive enough.
+
+Two failure modes are kept distinct on purpose. A fingerprint missing from a
+keyring the bot *could* read means sshd accepted a key nobody can account for,
+and that is a real alert. A fingerprint whose keyring the bot could *not* read
+(`/root/.ssh/authorized_keys` is mode 600) is reported as unverifiable instead —
+claiming "unrecognized key" on every nightly deploy would train the alert to be
+ignored.
+
+### 🕵️ Anomalous logins
+
+`ssh_baseline.py` keeps a persistent profile per `(node, fingerprint, user)`:
+usual source subnet, hour histogram and auth method. The in-memory correlator
+only spans 900 seconds, which is enough to tie a fail2ban ban to the failures
+that caused it but cannot answer "has this key ever logged in before".
+
+Signals, strongest first: unknown fingerprint · password auth on a keys-only
+host · key authorized for one account used on another · new source subnet (with
+an external IP outranking a LAN one) · login outside the key's usual schedule.
+
+The schedule signal only fires for keys that *have* a schedule — a deploy
+controller that always runs at 20:50 spans one hour bucket, an interactive key
+spans many and is never flagged for the hour. Profiles younger than five logins
+produce no anomalies at all: "I have never seen this" means nothing without
+history behind it.
+
+### ⚠️ Failed logins
+
+Below the brute-force threshold, failures are now reported individually with a
+per-IP cooldown. sshd distinguishes `Invalid user` (the account does not exist —
+generic Internet scanning, reported grey) from a failure against a real account
+(someone knows who to aim at, reported orange). Account enumeration produces no
+`Failed` line at all, so `Invalid user` and `[preauth]` disconnects are collected
+too.
+
 ## 🧰 Stack
 
 - Python 3.12
@@ -194,6 +336,63 @@ pip install -r requirements.txt
 cp .env.example .env  # fill in your real values
 python main.py
 ```
+
+### systemd hardening
+
+Production runs the bot as the dedicated `centinela` system account, not as an
+interactive administrator. The audited drop-in is
+`deploy/discord-bot-hardening.conf`; install it as
+`/etc/systemd/system/discord-bot.service.d/hardening.conf` only after moving
+writable state to `/var/lib/centinela` and any constrained remote-agent key to
+`/etc/centinela`. The account needs `adm` to read SSH/journal events and,
+currently, `docker` for container inspection and explicitly requested
+restarts. It must not belong to `sudo` or `lxd`.
+
+Because the drop-in empties `/home` and `/root` for the service, the
+`authorized_keys` that feed the fingerprint-to-identity map have to be
+re-exposed one file at a time through the `BindReadOnlyPaths=` lines, matching
+`SSH_KEY_DIRECTORY_FILES`. These are public keys and the fingerprint already
+reaches the journal on every login; what is not granted is the `.ssh` directory
+itself.
+
+Note the drop-in sets `ProtectHome=tmpfs`, not `yes`. With `yes`, systemd mounts
+`/home` and `/root` as read-only mode-`000` directories and cannot create a
+mount point inside them, so every `BindReadOnlyPaths=-` under those paths is
+skipped silently — `systemctl show -p BindReadOnlyPaths` still lists them, but
+the files never appear. Verify the real outcome inside the namespace, not in the
+unit properties:
+
+```bash
+PID=$(systemctl show discord-bot -p MainPID --value)
+sudo ls -la /proc/$PID/root/root/.ssh/
+```
+
+`BindReadOnlyPaths` only makes the file visible — Unix permissions still apply,
+so a root-owned `authorized_keys` also needs
+`setfacl -m u:centinela:r /root/.ssh/authorized_keys` to be readable. The
+directories above it do not need an ACL: systemd creates the mount points
+itself, at mode `755`, inside the private tmpfs. Without the file ACL the bot
+degrades honestly and reports root logins as unverifiable rather than
+unrecognized.
+
+The ACL lives on the inode, so anything that replaces `authorized_keys` rather
+than editing it in place drops the grant silently — `ssh-copy-id`, most editors
+writing through a temporary file, and any script ending in `os.replace()`. The
+bot keeps running and quietly downgrades every login on that account to
+unverifiable. After touching an `authorized_keys` that feeds
+`SSH_KEY_DIRECTORY_FILES`, re-check and reapply:
+
+```bash
+getfacl -p /home/luca/.ssh/authorized_keys | grep centinela \
+  || sudo setfacl -m u:centinela:r /home/luca/.ssh/authorized_keys
+```
+
+The drop-in makes the OS, home directories, kernel interfaces and namespaces
+read-only or inaccessible, removes every process capability and enables
+`NoNewPrivileges`. Validate with `systemd-analyze verify discord-bot.service`,
+then restart and confirm `systemd-analyze security discord-bot.service` plus
+the Discord gateway log. Docker group membership remains a root-equivalent
+trust boundary; the next hardening stage is replacing it with a narrow helper.
 
 ### Local GeoIP country database
 
@@ -224,12 +423,30 @@ See [`.env.example`](./.env.example) for the full list:
 | `WATCHED_SERVICES` / `MANAGED_SERVICES` | systemd services under supervision |
 | `ALLOWED_RESTART` | Services the bot is allowed to restart |
 | `SSH_FAIL_THRESHOLD` / `SSH_FAIL_WINDOW` | Threshold and window for brute-force detection |
+| `SSH_FAIL_NOTIFY_ENABLED` / `SSH_FAIL_NOTIFY_COOLDOWN_MIN` | Report failures *below* the brute-force threshold, rate-limited per IP |
+| `SSH_KEY_DIRECTORY_FILES` | `authorized_keys` to read as `user:/path`; needs a matching `BindReadOnlyPaths` under the hardening drop-in |
+| `SSH_KEY_LABELS` / `REMOTE_ARCH_SSH_KEY_LABELS` | `FINGERPRINT=Name` overrides, for when the key comment is not descriptive |
+| `SSH_KEY_REFRESH_MINUTES` | How often the key directories are re-read, so a new key does not need a bot restart |
+| `SSH_ANOMALY_ENABLED` / `SSH_BASELINE_PATH` | Anomalous-login detection and where its persistent profiles live |
 | `FAIL2BAN_ENABLED` | Notify new bans (client status with journald fallback) |
 | `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_ACCESS_TOKEN` | Optional Access authentication logs; use an account-scoped token with only `Access: Audit Logs Read` |
 | `CLOUDFLARE_ACCESS_APP` / `CLOUDFLARE_CORRELATION_SECONDS` | Exact Access hostname (optionally URL/path) and maximum clock/time skew used for SSH correlation |
 | `GEOIP_COUNTRY_DB` / `GEOIP_COUNTRY_LOCALE` | Local Country MMDB path and preferred country-name language |
 | `SWAP_ALERT_PCT` / `TEMP_ALERT_C` | Resource alert thresholds |
 | `GRAFANA_URL` / `GRAFANA_TOKEN` | Grafana API URL and Viewer service-account token |
+| `BACKUP_PATH` | Local Borg repo, checked by mtime of its `index.*`. Also the fallback when no metrics source is set |
+| `BACKUP_PROMETHEUS_URL` | Prometheus for the fleet backup report. Empty = go through Grafana's datasource proxy |
+| `BACKUP_PROMETHEUS_DATASOURCE` | Pin the datasource UID instead of discovering it at runtime |
+| `BACKUP_REPORT_EVERY_HOURS` / `BACKUP_REPORT_ALWAYS` | Cadence of the full periodic report, and whether to send it when everything is fine |
+| `BACKUP_ALERT_REMINDER_HOURS` | How often a still-degraded backup is repeated after the first alert |
+| `BACKUP_RUN_ANNOUNCE` | Announce backup runs as they start/progress/finish (default `true`) |
+| `BACKUP_RUN_WATCH_MINUTES` | How often to poll the orchestrator's run state (default `1`) |
+| `BACKUP_RUN_STATE_PATH` | Where the already-announced run is remembered across restarts |
+| `BACKUP_STALE_WARNING_HOURS` / `BACKUP_STALE_CRITICAL_HOURS` | When a backup counts as late (26 h) and as broken (48 h, the alert the backup system was designed around) |
+| `BACKUP_RESTORE_TEST_*_DAYS` / `BACKUP_CANARY_WARNING_HOURS` | Restore-verification and canary freshness thresholds. The 14-day critical is the same number as the backup RUNBOOK's Grafana alert, on purpose |
+| `BACKUP_PRUNE_WARNING_DAYS` / `BACKUP_CHECK_WARNING_DAYS` | Retention and `check --verify-data` recency thresholds |
+| `BACKUP_FREE_WARNING_GB` / `BACKUP_FREE_CRITICAL_GB` | Headroom left on the repo hosts |
+| `BACKUP_METRIC_LOOKBACK_DAYS` | `last_over_time` window that keeps a dead exporter's host visible instead of vanishing |
 | `GRAFANA_GUARDIAN_*` | Fleet panel, range, dimensions, and enable/disable switch for Guardian Report |
 | `ISP_GUARDIAN_URL` | ISP Uplink Guardian API, read-only. Empty = ONU layer skipped, everything else still works |
 | `NET_DNS_PROBE` / `NET_DNS_EXTERNAL` | Name to resolve, and the contrast resolver that isolates a broken local DNS |

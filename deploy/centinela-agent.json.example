@@ -12,6 +12,9 @@
   ],
   "backup_path": "/home/luca/Docker/db-truly/borgmatic",
   "ignored_ssh_key_fingerprints": [],
+  "key_directory_users": [
+    "root"
+  ],
   "smart_devices": [
     "/dev/sda",
     "/dev/nvme0n1",
