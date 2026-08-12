@@ -42,7 +42,8 @@ fi
 
 config_with_fingerprint=$(mktemp /tmp/centinela-agent-config.XXXXXX)
 sudoers_candidate=$(mktemp /tmp/centinela-agent-sudoers.XXXXXX)
-trap 'rm -f -- "$config_with_fingerprint" "$sudoers_candidate"' EXIT
+tmpfiles_candidate=$(mktemp /tmp/centinela-agent-tmpfiles.XXXXXX)
+trap 'rm -f -- "$config_with_fingerprint" "$sudoers_candidate" "$tmpfiles_candidate"' EXIT
 python3 -c '
 import json
 import sys
@@ -63,6 +64,14 @@ if [[ ! -x /opt/centinela-agent/venv/bin/python ]]; then
 fi
 /opt/centinela-agent/venv/bin/python -m pip install \
   --disable-pip-version-check --quiet "psutil==7.2.2"
+
+# Estado de CPU entre polls: tmpfs, pero fuera de /run/user/$UID, que systemd
+# borra al cerrarse la sesion SSH del agente.  Ver la nota en _state_path().
+printf 'd /run/centinela-agent 0700 %s %s -\n' "$target_user" "$target_user" \
+  > "$tmpfiles_candidate"
+install -o root -g root -m 0644 \
+  "$tmpfiles_candidate" /etc/tmpfiles.d/centinela-agent.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/centinela-agent.conf
 
 printf '%s ALL=(root) NOPASSWD: %s\n' \
   "$target_user" \

@@ -4,7 +4,6 @@ import psutil
 import subprocess
 import shutil
 import os
-import glob
 import asyncio
 import signal
 import sys
@@ -15,8 +14,10 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
 import netdiag
+from loop_guard import LoopGuard, arm_all
 import procmon
 import alerts
+import backup_monitor
 from alerts import ALARM, CRITICAL, NO_DATA, OK, WARNING, Alarm, AlarmEngine
 from grafana import GrafanaClient, GrafanaError, parse_range
 from fleet_report import render_fleet_pages
@@ -25,10 +26,12 @@ from remote_hosts import RemoteHostClient, RemoteHostConfig, RemoteHostError
 from security_events import (
     CloudflareAccessClient,
     EventCorrelator,
+    SshKeyDirectory,
     access_app_matches,
     classify_ssh_origin,
     cloudflare_event_id,
     is_loopback,
+    parse_ssh_keygen_fingerprints,
     parse_timestamp,
     parse_fail2ban_banned,
     parse_fail2ban_jails,
@@ -36,10 +39,13 @@ from security_events import (
     parse_ssh_line,
     utcnow,
 )
+from ssh_baseline import CRITICAL as ANOMALY_CRITICAL, LoginBaseline
 from docker_ops import (
+    display_name,
     docker_cmd,
     get_docker_stats,
     group_services,
+    is_anonymous,
     list_tasks,
     resolve_service,
     restart_service,
@@ -52,6 +58,32 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID_ENV = os.getenv('DISCORD_CHANNEL_ID')
 DEBUG_MODE = os.getenv('DEBUG_MODE', 'false').lower() in ('true', '1', 'yes')
 BACKUP_PATH = os.getenv('BACKUP_PATH', '')
+
+# --- SISTEMA DE BACKUPS DE LA FLOTA (ver backup_monitor.py) ---
+# El estado se lee de las metricas que ya publica homelab-backup, no por SSH.
+# Dos caminos: Prometheus directo, o el proxy de datasource de Grafana (que
+# reusa GRAFANA_URL/GRAFANA_TOKEN y no necesita abrir el 9090 a nadie).
+# Sin ninguno de los dos configurado, `!backups` sigue funcionando como antes
+# contra BACKUP_PATH: la feature es aditiva.
+BACKUP_PROMETHEUS_URL = os.getenv('BACKUP_PROMETHEUS_URL', '').rstrip('/')
+BACKUP_PROMETHEUS_DATASOURCE = os.getenv('BACKUP_PROMETHEUS_DATASOURCE', '').strip()
+BACKUP_HTTP_TIMEOUT = int(os.getenv('BACKUP_HTTP_TIMEOUT_SECONDS', '20'))
+BACKUP_REPORT_EVERY_H = int(os.getenv('BACKUP_REPORT_EVERY_HOURS', '12'))
+BACKUP_REPORT_ALWAYS = os.getenv(
+    'BACKUP_REPORT_ALWAYS', 'true'
+).lower() in ('true', '1', 'yes')
+BACKUP_ALERT_REMINDER_H = int(os.getenv('BACKUP_ALERT_REMINDER_HOURS', '12'))
+BACKUP_REPORT_ON_START = os.getenv(
+    'BACKUP_REPORT_ON_START', 'true'
+).lower() in ('true', '1', 'yes')
+# Avisos de corrida: arranco / termino / cuando es el proximo. Se consulta cada
+# minuto porque la pregunta es "¿esta pasando AHORA?"; es una sola consulta
+# instantanea que trae las diez series del orquestador.
+BACKUP_RUN_WATCH_MIN = max(1, int(os.getenv('BACKUP_RUN_WATCH_MINUTES', '1')))
+BACKUP_RUN_ANNOUNCE = os.getenv(
+    'BACKUP_RUN_ANNOUNCE', 'true'
+).lower() in ('true', '1', 'yes')
+BACKUP_POLICY = backup_monitor.BackupPolicy.from_env()
 SAFE_SUBNETS = [s.strip() for s in os.getenv('SAFE_SUBNETS', '192.168.,10.,172.').split(',')]
 SERVER_NAME = os.getenv('SERVER_NAME', 'Server')
 WATCHED_SERVICES = [s.strip() for s in os.getenv('WATCHED_SERVICES', '').split(',') if s.strip()]
@@ -80,6 +112,72 @@ REMOTE_ARCH_SSH_FAIL_WINDOW = int(
     os.getenv('REMOTE_ARCH_SSH_FAIL_WINDOW', str(SSH_FAIL_WINDOW))
 )
 
+# --- IDENTIDAD DE CLAVES SSH ---
+# sshd escribe el fingerprint de la clave aceptada en cada login (LogLevel
+# INFO, sin necesidad de VERBOSE). Traducirlo a un nombre es lo que convierte
+# "entro luca desde 192.168.2.40" en "entro el bot de Ansible": el usuario Unix
+# y la IP son iguales para varias automatizaciones, el fingerprint no.
+#
+# Los authorized_keys locales se listan explicitamente porque el servicio corre
+# con ProtectHome=yes; cada archivo necesita su BindReadOnlyPaths en el
+# drop-in de hardening (ver deploy/discord-bot-hardening.conf).
+def _parse_key_files(raw):
+    """``usuario:/ruta`` o ``/ruta`` (el usuario se deduce del directorio)."""
+    entries = []
+    for item in str(raw or '').split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if ':' in item and not item.startswith('/'):
+            user, _, path = item.partition(':')
+        else:
+            path = item
+            parts = os.path.normpath(path).split(os.sep)
+            user = parts[2] if len(parts) > 3 and parts[1] == 'home' else (
+                'root' if path.startswith('/root/') else ''
+            )
+        entries.append((user.strip(), path.strip()))
+    return entries
+
+
+def _parse_key_labels(raw):
+    """``SHA256:xxx=Ansible,SHA256:yyy=Dokploy``."""
+    labels = {}
+    for item in str(raw or '').split(','):
+        fingerprint, _, label = item.partition('=')
+        if fingerprint.strip() and label.strip():
+            labels[fingerprint.strip()] = label.strip()
+    return labels
+
+
+SSH_KEY_FILES = _parse_key_files(os.getenv('SSH_KEY_DIRECTORY_FILES', ''))
+SSH_KEY_LABELS = _parse_key_labels(os.getenv('SSH_KEY_LABELS', ''))
+REMOTE_SSH_KEY_LABELS = _parse_key_labels(
+    os.getenv('REMOTE_ARCH_SSH_KEY_LABELS', '')
+)
+SSH_KEY_REFRESH_MIN = max(5, int(os.getenv('SSH_KEY_REFRESH_MINUTES', '30')))
+# Cada cuanto se puede repetir el aviso de fallos para una misma IP. Sin esto
+# un escaneo de 500 intentos son 500 embeds.
+SSH_FAIL_NOTIFY_COOLDOWN = timedelta(
+    minutes=max(1, int(os.getenv('SSH_FAIL_NOTIFY_COOLDOWN_MIN', '15')))
+)
+SSH_FAIL_NOTIFY_ENABLED = os.getenv(
+    'SSH_FAIL_NOTIFY_ENABLED', 'true'
+).lower() in ('true', '1', 'yes')
+_STATE_DIR = (
+    os.getenv('STATE_DIRECTORY', '').split(':')[0]
+    or os.path.expanduser('~/.local/state/centinela')
+)
+SSH_BASELINE_PATH = os.getenv(
+    'SSH_BASELINE_PATH', os.path.join(_STATE_DIR, 'ssh-baseline.json')
+)
+BACKUP_RUN_STATE_PATH = os.getenv(
+    'BACKUP_RUN_STATE_PATH', os.path.join(_STATE_DIR, 'backup-run.json')
+)
+SSH_ANOMALY_ENABLED = os.getenv(
+    'SSH_ANOMALY_ENABLED', 'true'
+).lower() in ('true', '1', 'yes')
+
 # --- DIAGNOSTICO DE RED (ver netdiag.py) ---
 # El Centinela aca solo OBSERVA: diagnostica y reporta. Quien reinicia el ONU es
 # el ISP Uplink Guardian; nosotros lo consultamos de solo lectura.
@@ -102,6 +200,7 @@ GRAFANA_PANEL_W = int(os.getenv('GRAFANA_PANEL_WIDTH', '1000'))
 GRAFANA_PANEL_H = int(os.getenv('GRAFANA_PANEL_HEIGHT', '500'))
 GRAFANA_DASH_W = int(os.getenv('GRAFANA_DASH_WIDTH', '1200'))
 GRAFANA_DASH_H = int(os.getenv('GRAFANA_DASH_HEIGHT', '1400'))
+GRAFANA_HTTP_TIMEOUT = int(os.getenv('GRAFANA_HTTP_TIMEOUT_SECONDS', '70'))
 GRAFANA_ORANGE = 0xF46800
 GRAFANA_GUARDIAN_ENABLED = os.getenv(
     'GRAFANA_GUARDIAN_ENABLED', 'true'
@@ -117,9 +216,12 @@ GRAFANA_GUARDIAN_H = int(os.getenv('GRAFANA_GUARDIAN_HEIGHT', '1600'))
 GRAFANA_GUARDIAN_PAGE_H = int(
     os.getenv('GRAFANA_GUARDIAN_PAGE_HEIGHT', '900')
 )
+GRAFANA_GUARDIAN_START_DELAY = max(0, int(
+    os.getenv('GRAFANA_GUARDIAN_START_DELAY_SECONDS', '300')
+))
 
 grafana_client = (
-    GrafanaClient(GRAFANA_URL, GRAFANA_TOKEN)
+    GrafanaClient(GRAFANA_URL, GRAFANA_TOKEN, timeout=GRAFANA_HTTP_TIMEOUT)
     if GRAFANA_URL and GRAFANA_TOKEN else None
 )
 cloudflare_client = (
@@ -134,6 +236,9 @@ remote_arch_config = RemoteHostConfig.from_env()
 remote_arch = (
     RemoteHostClient(remote_arch_config) if remote_arch_config else None
 )
+local_key_directory = SshKeyDirectory(SSH_KEY_LABELS)
+remote_key_directory = SshKeyDirectory(REMOTE_SSH_KEY_LABELS)
+login_baseline = LoginBaseline(SSH_BASELINE_PATH if SSH_ANOMALY_ENABLED else '')
 
 if not TOKEN or not CHANNEL_ID_ENV:
     print("ERROR: Falta DISCORD_TOKEN o DISCORD_CHANNEL_ID en .env")
@@ -194,6 +299,9 @@ last_alert_time = {
     "speedtest": datetime.min,
     "slow": datetime.min,
 }
+# Ultimo aviso individual de fallo por IP (local y remoto en el mismo dict,
+# con prefijo de nodo en la clave).
+ssh_fail_notified = {}
 ALERT_COOLDOWN = timedelta(hours=1)
 
 # --- ALARMAS (ver alerts.py) ---
@@ -267,7 +375,9 @@ remote_security_seen_order = deque(maxlen=4000)
 remote_last_alert_time = {}
 remote_last_docker_alert = {}
 remote_docker_heal_attempts = {}
-remote_backup_alerted = False
+remote_backup_alert = backup_monitor.AlertState(
+    reminder=timedelta(hours=BACKUP_ALERT_REMINDER_H)
+)
 remote_stats_counter = {
     "ssh_events": 0,
     "ssh_fails": 0,
@@ -813,16 +923,325 @@ def get_service_logs(service_name, lines=5):
         return ""
 
 # ==========================================
-# HELPER BACKUP BORG
+# BACKUPS (ver backup_monitor.py)
 # ==========================================
-def get_borg_last_backup(repo_path):
-    """Devuelve (mtime: datetime, index_file: str) del index.* mas reciente en el repo Borg."""
-    candidates = glob.glob(os.path.join(repo_path, "index.*"))
-    if not candidates:
-        return None, None
-    newest = max(candidates, key=os.path.getmtime)
-    mtime = datetime.fromtimestamp(os.path.getmtime(newest))
-    return mtime, newest
+# La logica —umbrales, parseo de metricas, redaccion— vive en backup_monitor.
+# Aca queda solo el pegamento con Discord. Antes habia cuatro copias de "esto
+# esta viejo si pasaron 25 h" (comando local, watcher local, comando remoto,
+# watcher remoto) que ya habian empezado a divergir.
+_backup_source_cache = None
+backup_source_failed = False
+backup_alert_state = backup_monitor.AlertState(
+    reminder=timedelta(hours=BACKUP_ALERT_REMINDER_H)
+)
+local_backup_alert = backup_monitor.AlertState(
+    reminder=timedelta(hours=BACKUP_ALERT_REMINDER_H)
+)
+# Mensaje del aviso de "backup en curso", para editarlo con el avance en vez de
+# postear uno nuevo por host. Solo dura lo que dure el proceso: si el bot se
+# reinicia a mitad de corrida, el proximo aviso es un mensaje nuevo y listo.
+backup_run_message = None
+
+
+def backup_fleet_configured():
+    return bool(BACKUP_PROMETHEUS_URL or (GRAFANA_URL and GRAFANA_TOKEN))
+
+
+async def get_backup_source():
+    """Fuente de metricas de backup, resuelta una sola vez y cacheada.
+
+    Prometheus directo gana si esta configurado. Si no, se va por Grafana y se
+    descubre el UID del datasource en caliente (un token Viewer alcanza), para
+    no hardcodear un UID que cambia si el datasource se recrea.
+    """
+    global _backup_source_cache
+    if _backup_source_cache is not None:
+        return _backup_source_cache
+
+    if BACKUP_PROMETHEUS_URL:
+        _backup_source_cache = backup_monitor.direct_source(
+            BACKUP_PROMETHEUS_URL, timeout=BACKUP_HTTP_TIMEOUT
+        )
+        return _backup_source_cache
+
+    if not (GRAFANA_URL and GRAFANA_TOKEN):
+        raise backup_monitor.BackupMonitorError(
+            "no hay fuente de metricas: configura BACKUP_PROMETHEUS_URL, "
+            "o GRAFANA_URL + GRAFANA_TOKEN para ir por el proxy de Grafana."
+        )
+
+    uid = BACKUP_PROMETHEUS_DATASOURCE
+    if not uid:
+        http = backup_monitor.HttpJson(
+            GRAFANA_URL,
+            headers={"Authorization": f"Bearer {GRAFANA_TOKEN}"},
+            timeout=BACKUP_HTTP_TIMEOUT,
+        )
+        uid = await backup_monitor.discover_prometheus_datasource(http)
+
+    _backup_source_cache = backup_monitor.grafana_proxy_source(
+        GRAFANA_URL, GRAFANA_TOKEN, uid, timeout=BACKUP_HTTP_TIMEOUT
+    )
+    return _backup_source_cache
+
+
+def embed_from_view(view, timestamp=None):
+    """Traduce una ReportView (sin dependencias de Discord) a un embed."""
+    embed = discord.Embed(
+        title=view.title,
+        description=view.description or None,
+        color=view.color,
+        timestamp=timestamp,
+    )
+    for field in view.fields[:25]:
+        embed.add_field(name=field.name[:256], value=field.value[:1024], inline=field.inline)
+    if view.footer:
+        embed.set_footer(text=view.footer[:2048])
+    return embed
+
+
+async def fetch_backup_report():
+    source = await get_backup_source()
+    return await backup_monitor.collect_report(source, BACKUP_POLICY)
+
+
+async def fetch_backup_run():
+    source = await get_backup_source()
+    return await backup_monitor.collect_run_status(source)
+
+
+def load_backup_run_state():
+    """Lo ultimo que se anuncio de una corrida, de la sesion anterior.
+
+    Persiste porque el Centinela vive en pentium, que el propio backup enciende
+    a las 03:00 y apaga al terminar: entre el "arranco" y el "termino" este
+    proceso se muere. En memoria, el aviso de fin no llegaria nunca — o llegaria
+    de nuevo en cada arranque del bot.
+    """
+    try:
+        with open(BACKUP_RUN_STATE_PATH, encoding='utf-8') as handle:
+            state = json.load(handle)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_backup_run_state(state):
+    directory = os.path.dirname(BACKUP_RUN_STATE_PATH) or '.'
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        tmp = f"{BACKUP_RUN_STATE_PATH}.tmp"
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            json.dump(state, handle, separators=(',', ':'))
+        os.replace(tmp, BACKUP_RUN_STATE_PATH)
+    except OSError as error:
+        if DEBUG_MODE:
+            print(f"No pude guardar el estado de la corrida: {error}", file=sys.stderr)
+
+
+backup_run_announcer = backup_monitor.RunAnnouncer(load_backup_run_state())
+
+
+async def _backup_run_or_none():
+    """Estado de la corrida, o None si no se puede leer.
+
+    El reporte de flota no depende de esto: si el orquestador no responde, el
+    reporte sale igual sin la seccion de la corrida. Un dato de mas no puede
+    tumbar el reporte entero.
+    """
+    try:
+        return await fetch_backup_run()
+    except backup_monitor.BackupMonitorError as error:
+        if DEBUG_MODE:
+            print(f"Estado de la corrida: {error}", file=sys.stderr)
+        return None
+
+
+async def local_backup_view():
+    status = await asyncio.to_thread(
+        backup_monitor.inspect_local_repo, BACKUP_PATH, SERVER_NAME
+    )
+    return backup_monitor.render_local(status, BACKUP_POLICY)
+
+# ==========================================
+# IDENTIDAD DE CLAVES SSH
+# ==========================================
+def _read_local_key_directory():
+    """Fingerprints de los authorized_keys declarados en el entorno.
+
+    Se invoca `ssh-keygen -lf` en vez de parsear el archivo a mano porque
+    calcular el fingerprint implica decodificar el blob base64 y hashearlo con
+    el mismo formato que usa sshd; delegarlo evita que un formato de clave
+    nuevo (o un `cert-authority`) devuelva un hash que no matchea el del log.
+    """
+    entries = []
+    covered = []
+    for user, path in SSH_KEY_FILES:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            result = subprocess.run(
+                ["ssh-keygen", "-lf", path],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            continue
+        for entry in parse_ssh_keygen_fingerprints(result.stdout):
+            entry["user"] = user
+            entries.append(entry)
+        if user:
+            covered.append(user)
+    return entries, covered
+
+
+def _load_remote_key_entries(payload):
+    """Convierte la respuesta cruda de la accion `keys` del agente."""
+    entries = []
+    for item in (payload or {}).get("entries") or []:
+        if not isinstance(item, dict):
+            continue
+        for entry in parse_ssh_keygen_fingerprints(item.get("line", "")):
+            entry["user"] = str(item.get("user") or "")
+            entries.append(entry)
+    return entries, [
+        str(user) for user in (payload or {}).get("covered_users") or []
+    ]
+
+
+def _key_identity_field(directory, event):
+    """Campo 'Clave' del embed: quien es, no solo que hash uso.
+
+    Devuelve ``(texto, reconocida)``. El fingerprint completo nunca entra al
+    embed: 12 caracteres alcanzan para distinguir las claves de una flota y
+    mantienen el mensaje legible en el celular.
+    """
+    fingerprint = str(event.get("fingerprint") or "")
+    method = str(event.get("method") or "")
+    if not fingerprint:
+        if method and method != "publickey":
+            return f"Sin clave · autenticacion `{method}`", False
+        return "sshd no registro el fingerprint", False
+    label, known = directory.describe(fingerprint)
+    short = directory.short(fingerprint)
+    key_type = str(event.get("key_type") or "").upper()
+    suffix = f" · `{key_type}` `…{short}`" if key_type else f" · `…{short}`"
+    if known:
+        return f"**{label}**{suffix}", True
+    return f"⚠️ **Clave no reconocida**{suffix}", False
+
+
+def _anomaly_field(verdict):
+    if not verdict or not verdict.reasons:
+        return None
+    return "\n".join(f"• {reason['text']}" for reason in verdict.reasons)
+
+
+def _assess_login(node, event, directory, timestamp):
+    """Evalua contra la linea base y luego incorpora el login al perfil.
+
+    El orden importa: `assess` primero, `observe` despues. Al reves, todo
+    login seria conocido por construccion y la deteccion no serviria de nada.
+    """
+    if not SSH_ANOMALY_ENABLED:
+        return None
+    if not login_baseline.loaded:
+        login_baseline.load()
+    verdict = login_baseline.assess(node, event, directory, now=timestamp)
+    login_baseline.observe(node, event, now=timestamp)
+    login_baseline.prune(now=timestamp)
+    if not login_baseline.save() and DEBUG_MODE:
+        print(
+            f"No se pudo persistir la linea base en {SSH_BASELINE_PATH}",
+            file=sys.stderr,
+        )
+    return verdict
+
+
+def _build_ssh_fail_embed(event, summary, *, node="", title_prefix=""):
+    """Embed de un intento fallido, ya agregado por IP.
+
+    Un fallo suelto no es una alerta y tampoco es ruido: la diferencia esta en
+    contra QUE cuenta se intento. sshd distingue explicitamente "invalid user"
+    (la cuenta no existe: escaneo generico de Internet) de un fallo contra una
+    cuenta real, que significa que alguien sabe a quien apuntarle. Solo el
+    segundo caso merece color rojo.
+    """
+    ip = event.get("ip") or "desconocida"
+    user = event.get("user") or "?"
+    invalid = bool(event.get("invalid_user"))
+    external = not any(
+        str(ip).startswith(prefix) for prefix in SAFE_SUBNETS if prefix
+    ) and not is_loopback(ip)
+    serious = not invalid
+    embed = discord.Embed(
+        title=(
+            f"{title_prefix}⚠️ Intento de login fallido"
+            if serious
+            else f"{title_prefix}👣 Sondeo SSH rechazado"
+        ),
+        description=(
+            f"Cuenta **inexistente** `{user}`: patron de escaneo automatico."
+            if invalid
+            else f"Fallo la autenticacion de la cuenta real `{user}`."
+        ),
+        color=0xe67e22 if serious else 0x95a5a6,
+    )
+    embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
+    embed.add_field(
+        name="🔁 En la ventana",
+        value=f"{summary.get('ssh_fails', 1)} intento(s)",
+        inline=True,
+    )
+    method = str(event.get("method") or "")
+    if method and method != "none":
+        embed.add_field(name="🔑 Metodo", value=f"`{method}`", inline=True)
+    if external:
+        embed.add_field(
+            name="🏠 Origen", value="⚠️ Fuera de la red local", inline=True
+        )
+    users = summary.get("users") or []
+    if len(users) > 1:
+        embed.add_field(
+            name="👥 Cuentas probadas",
+            value=", ".join(f"`{item}`" for item in users[:10]),
+            inline=False,
+        )
+    if node:
+        embed.set_footer(text=f"Nodo: {node}")
+    return embed
+
+
+def _should_notify_fail(store, key, now, cooldown=SSH_FAIL_NOTIFY_COOLDOWN):
+    if now - store.get(key, datetime.min) < cooldown:
+        return False
+    store[key] = now
+    return True
+
+
+@tasks.loop(minutes=SSH_KEY_REFRESH_MIN)
+async def refresh_key_directories():
+    """Relee los authorized_keys, local y remoto.
+
+    Periodico y no una sola vez al arrancar: agregar una clave nueva no
+    deberia exigir reiniciar el bot para que deje de reportarse como
+    desconocida.
+    """
+    entries, covered = await asyncio.to_thread(_read_local_key_directory)
+    local_key_directory.load(entries, covered_users=covered)
+    if remote_arch is None:
+        return
+    try:
+        payload = await remote_arch.request("keys")
+    except RemoteHostError as error:
+        if DEBUG_MODE:
+            print(f"No se pudo leer el directorio de claves remoto: {error}",
+                  file=sys.stderr)
+        return
+    remote_entries, remote_covered = _load_remote_key_entries(payload)
+    remote_key_directory.load(remote_entries, covered_users=remote_covered)
+
 
 # ==========================================
 # SSH WATCHER (MULTI-DISTRO)
@@ -919,12 +1338,19 @@ async def _process_ssh_login(channel, line):
         SAFE_SUBNETS,
         correlated=cf_event is not None,
     )
+    identity, recognized = _key_identity_field(local_key_directory, event)
+    verdict = _assess_login(SERVER_NAME, event, local_key_directory, timestamp)
+    suspicious = bool(verdict and verdict.suspicious)
     embed = discord.Embed(
-        title="🔑 Nuevo Login SSH",
+        title="🚨 Login SSH sospechoso" if suspicious else "🔑 Nuevo Login SSH",
         color=(
-            0xf1c40f
-            if origin["unresolved_proxy"]
-            else (0x2ecc71 if origin["is_local"] else 0xe67e22)
+            0xff0000
+            if suspicious
+            else (
+                0xf1c40f
+                if origin["unresolved_proxy"] or not recognized
+                else (0x2ecc71 if origin["is_local"] else 0xe67e22)
+            )
         ),
     )
     embed.add_field(name="👤 Usuario", value=f"`{user}`", inline=True)
@@ -938,6 +1364,14 @@ async def _process_ssh_login(channel, line):
         value=origin["label"],
         inline=True,
     )
+    embed.add_field(name="🔐 Clave", value=identity, inline=False)
+    anomalies = _anomaly_field(verdict)
+    if anomalies:
+        embed.add_field(
+            name="🚩 Anomalías" if suspicious else "ℹ️ Notas",
+            value=anomalies,
+            inline=False,
+        )
     if cf_event:
         embed.add_field(
             name="☁️ Cloudflare Access",
@@ -974,6 +1408,18 @@ async def _process_ssh_fail(channel, line):
     )
     recent_fails = summary["ssh_fails"]
     alert_key = f"bruteforce:{ip}"
+    # Por debajo del umbral de fuerza bruta se avisa igual, pero acotado por
+    # IP: es la unica forma de enterarse de un intento aislado contra una
+    # cuenta real, que es justo el caso que el umbral nunca alcanza.
+    if (
+        SSH_FAIL_NOTIFY_ENABLED
+        and event
+        and recent_fails < SSH_FAIL_THRESHOLD
+        and _should_notify_fail(ssh_fail_notified, f"local:{ip}", now)
+    ):
+        await channel.send(
+            embed=_build_ssh_fail_embed(event, summary, node=SERVER_NAME)
+        )
     if (
         recent_fails >= SSH_FAIL_THRESHOLD
         and now - last_alert_time.get(alert_key, datetime.min) > ALERT_COOLDOWN
@@ -1135,6 +1581,35 @@ async def _remote_request(ctx, action, *args, status=None):
     return payload
 
 
+def _remote_top_field(snapshot, key="cpu"):
+    """Filas de procesos remotos, o el motivo por el que no las hay.
+
+    Nunca devuelve una tabla vacia haciendola pasar por medicion: en el primer
+    poll despues de un reinicio no existe muestra anterior contra la cual
+    calcular el delta de CPU, y decirlo es mas util que publicar ceros.
+    """
+    processes = (snapshot or {}).get("processes") or {}
+    rows = processes.get(key) or []
+    if not rows:
+        if not processes:
+            return "_El agente remoto no reporta procesos (versión antigua)._"
+        return "_Todavía sin muestra válida de procesos._"
+    if key == "cpu" and not processes.get("warm"):
+        return "_Primer muestreo tras reiniciar: sin ventana para medir CPU._"
+    lines = []
+    for row in rows[:4]:
+        value = row.get(key)
+        if value is None:
+            continue
+        name = str(row.get("container") or row.get("name") or "?")[:22]
+        bar = "█" * min(int(value / 10), 10)
+        lines.append(
+            f"`{name:<22}` {value:>5.1f}% `{bar}`\n"
+            f"　pid `{row.get('pid', '?')}`"
+        )
+    return "\n".join(lines) if lines else "_Sin procesos medibles._"
+
+
 def _remote_alarm_embed(event, snapshot):
     alarm = event["alarm"]
     value = event["value"]
@@ -1180,6 +1655,17 @@ def _remote_alarm_embed(event, snapshot):
             ),
             inline=False,
         )
+        # El equivalente remoto de lo que build_alarm_embed ya hacia local:
+        # una alarma de CPU al 98% sin decir quien la esta consumiendo obliga a
+        # abrir una sesion para averiguar lo que el bot ya tenia en la mano.
+        if alarm.name in ("cpu", "ram", "swap"):
+            embed.add_field(
+                name="Top procesos",
+                value=_remote_top_field(
+                    snapshot, "cpu" if alarm.name == "cpu" else "ram"
+                ),
+                inline=False,
+            )
         if alarm.name == "temp" and snapshot.get("temperatures"):
             temps = snapshot["temperatures"]
             hottest = max(temps, key=temps.get)
@@ -1432,6 +1918,29 @@ async def _remote_services_command(ctx):
     await ctx.send(embed=embed)
 
 
+def _remote_services(containers):
+    """Agrupa la respuesta cruda del agente igual que hace !ct local.
+
+    El agente manda `docker ps -a` sin tocar, asi que bajo Swarm cada servicio
+    llega dos veces: la task nueva corriendo y la vieja en Exited(255) que dejo
+    el ultimo deploy. Sin agrupar, la mitad de la lista son fantasmas rojos que
+    parecen caidas, y cada nombre arrastra 25 caracteres de task id.
+    """
+    tasks_in = []
+    for item in containers:
+        name = item.get("name") or "?"
+        service = service_of(name)
+        tasks_in.append({
+            **item,
+            "name": name,
+            "service": service,
+            "display": display_name(service, swarm=service != name),
+            "status": item.get("status") or item.get("state") or "",
+            "running": (item.get("state") or "").lower() == "running",
+        })
+    return group_services(tasks_in)
+
+
 async def _remote_containers_command(ctx):
     payload = await _remote_request(ctx, "docker")
     if not payload:
@@ -1441,54 +1950,87 @@ async def _remote_containers_command(ctx):
     containers = payload.get("containers") or []
     if not containers:
         return await ctx.send(f"🐳 **{_remote_name()}** no tiene contenedores.")
-    down = sum(
-        1 for item in containers if item.get("state", "").lower() != "running"
-    )
+    services = _remote_services(containers)
+    down = sum(1 for s in services if not s["current"]["running"])
     embed = _remote_embed(
         f"🐳 Contenedores — {_remote_name()}",
         color=0xe74c3c if down else 0x2ecc71,
     )
-    for item in containers[:18]:
-        state = item.get("state", "").lower()
+    for service in services[:18]:
+        item = service["current"]
         icon = {"running": "🟢", "restarting": "🔄", "exited": "🔴"}.get(
-            state, "🟡"
+            (item.get("state") or "").lower(), "🟡"
         )
-        value = (
-            f"`{item.get('status') or state or '?'}`\n"
-            f"`{item.get('image') or '?'}`"
-        )
+        value = f"`{item['status'] or '?'}`\n`{item.get('image') or '?'}`"
         if item.get("ports"):
             value += f"\n`{item['ports'][:70]}`"
         value += (
             f"\nCPU: `{item.get('cpu', 0):.1f}%` "
             f"RAM: `{item.get('ram', 0):.1f}%`"
         )
+        if service["stale"]:
+            value += f"\n_{service['stale']} task(s) vieja(s) sin limpiar_"
         embed.add_field(
-            name=f"{icon} {item.get('name') or '?'}",
-            value=value,
-            inline=True,
+            name=f"{icon} {service['display']}", value=value, inline=True
         )
+    if len(services) > 18:
+        embed.set_footer(text=f"...y {len(services) - 18} servicio(s) mas")
     await ctx.send(embed=embed)
 
 
+async def _remote_resolve(ctx, wanted):
+    """Traduce lo que se tipeo al nombre real del contenedor en el nodo remoto.
+
+    Cuesta un viaje SSH extra, pero sin esto la lista miente: !ct muestra
+    "parse-solid-state-bus" y `docker logs` de la otra punta no conoce ese
+    nombre, ni tampoco el del servicio de Swarm — solo el de la task.
+    """
+    payload = await _remote_request(ctx, "docker")
+    if not payload or not payload.get("available"):
+        return None
+    services = _remote_services(payload.get("containers") or [])
+    target = wanted.strip().lower()
+    for service in services:
+        if target in (
+            service["display"].lower(),
+            service["service"].lower(),
+            service["current"]["name"].lower(),
+        ):
+            return service
+    for service in services:
+        if target in service["display"].lower() or target in service["service"].lower():
+            return service
+    await ctx.send(
+        f"❌ No encontré `{wanted}` en **{_remote_name()}**. "
+        f"Mirá `!ct {_remote_name()}`."
+    )
+    return None
+
+
 async def _remote_logs_command(ctx, service):
-    payload = await _remote_request(ctx, "logs", service, 25)
+    target = await _remote_resolve(ctx, service)
+    if not target:
+        return
+    payload = await _remote_request(ctx, "logs", target["current"]["name"], 25)
     if not payload:
         return
-    embed = _remote_embed(f"📋 Logs: {service}")
+    embed = _remote_embed(f"📋 Logs: {target['display']}")
     embed.description = f"```\n{(payload.get('output') or 'Sin salida.')[-1800:]}\n```"
     await ctx.send(embed=embed)
 
 
 async def _remote_restart_command(ctx, service):
+    target = await _remote_resolve(ctx, service)
+    if not target:
+        return
     payload = await _remote_request(
-        ctx, "restart", service,
-        status=f"🔄 Reiniciando `{service}` en **{_remote_name()}**...",
+        ctx, "restart", target["current"]["name"],
+        status=f"🔄 Reiniciando `{target['display']}` en **{_remote_name()}**...",
     )
     if not payload:
         return
     await ctx.send(embed=_remote_embed(
-        f"✅ Reiniciado: {service}",
+        f"✅ Reiniciado: {target['display']}",
         description=f"Por **{ctx.author.display_name}**.",
         color=0x2ecc71,
     ))
@@ -1528,67 +2070,43 @@ async def _remote_backups_command(ctx):
     payload = await _remote_request(ctx, "backup")
     if not payload:
         return
-    if not payload.get("configured"):
-        return await ctx.send(
-            f"❌ Backup no configurado en **{_remote_name()}**."
-        )
-    if not payload.get("exists"):
-        return await ctx.send(
-            f"❌ El repositorio de backup de **{_remote_name()}** no existe."
-        )
-    timestamp = payload.get("last_timestamp")
-    if not timestamp:
-        return await ctx.send(
-            f"❌ No se encontró `index.*` en el backup de **{_remote_name()}**."
-        )
-    modified = datetime.fromtimestamp(timestamp)
-    age = datetime.now() - modified
-    healthy = age < timedelta(hours=25)
-    embed = _remote_embed(
-        f"💾 Backup Borg — {_remote_name()}",
-        color=0x2ecc71 if healthy else 0xff0000,
-    )
-    embed.add_field(
-        name="Índice", value=f"`{payload.get('index', '?')}`", inline=False
-    )
-    embed.add_field(
-        name="Última ejecución",
-        value=modified.strftime("%d/%m/%Y %H:%M"),
-        inline=True,
-    )
-    embed.add_field(
-        name="Antigüedad", value=str(age).split(".")[0], inline=True
-    )
-    embed.add_field(
-        name="Tamaño repo",
-        value=format_bytes(payload.get("size", 0)),
-        inline=True,
-    )
-    embed.add_field(
-        name="Estado",
-        value="✅ Al día" if healthy else "🔴 Desactualizado",
-        inline=False,
-    )
-    await ctx.send(embed=embed)
+    status = backup_monitor.local_status_from_payload(payload, label=_remote_name())
+    view = backup_monitor.render_local(status, BACKUP_POLICY)
+    await ctx.send(embed=embed_from_view(view))
 
 
 # ==========================================
 # EVENTOS Y TAREAS
 # ==========================================
+# MONITOR_LOOPS y el guardia se definen al final del archivo, despues del
+# ultimo @tasks.loop: la lista nombra los loops y aca arriba todavia no
+# existen. on_ready los usa recien cuando lo llaman, asi que le alcanza.
 @bot.event
 async def on_ready():
     print(f"Bot Centinela ONLINE: {bot.user}")
+    # Antes de cualquier start(). Rearmar es idempotente --error() pisa el
+    # manejador anterior-- y on_ready se repite en cada reconexion.
+    arm_all(MONITOR_LOOPS, loop_guard)
     for task in [collect_history, watch_resources, watch_docker_loops, watch_docker_resources, guardian_report, watch_network, watch_speed]:
         if not task.is_running():
             task.start()
     if BACKUP_PATH and not watch_backups.is_running():
         watch_backups.start()
+    if backup_fleet_configured():
+        for task in [watch_backup_fleet, backup_fleet_report, watch_backup_runs]:
+            if not task.is_running():
+                task.start()
     if WATCHED_SERVICES and not watch_services.is_running():
         watch_services.start()
     if FAIL2BAN_ENABLED and not watch_fail2ban.is_running():
         watch_fail2ban.start()
     if cloudflare_client is not None and not watch_cloudflare_access.is_running():
         watch_cloudflare_access.start()
+    if not refresh_key_directories.is_running():
+        # Antes del primer login posible: sin el directorio cargado, toda clave
+        # se veria como no reconocida y el primer aviso seria un falso positivo.
+        await refresh_key_directories()
+        refresh_key_directories.start()
     if remote_arch is not None:
         for task in [
             watch_remote_arch,
@@ -1621,7 +2139,7 @@ async def on_ready():
             "`!restart <s>` Reiniciar un servicio\n\n"
             "**Mantenimiento**\n"
             "`!updates`   Actualizaciones\n"
-            "`!backups`   Estado de backups\n\n"
+            "`!backups`   Backups de la flota (`local`, `<host>`)\n\n"
             "**Nodo Arch unificado**\n"
             "`!arch`      Panel remoto\n"
             "`!arch help` Comandos del nodo remoto\n"
@@ -1788,12 +2306,25 @@ async def _notify_remote_ssh_login(channel, event, timestamp):
         SAFE_SUBNETS,
         correlated=cloudflare_event is not None,
     )
+    identity, recognized = _key_identity_field(remote_key_directory, event)
+    verdict = _assess_login(
+        _remote_name(), event, remote_key_directory, timestamp
+    )
+    suspicious = bool(verdict and verdict.suspicious)
     embed = _remote_embed(
-        f"🔑 Nuevo Login SSH — {_remote_name()}",
+        (
+            f"🚨 Login SSH sospechoso — {_remote_name()}"
+            if suspicious
+            else f"🔑 Nuevo Login SSH — {_remote_name()}"
+        ),
         color=(
-            0xf1c40f
-            if origin["unresolved_proxy"]
-            else (0x2ecc71 if origin["is_local"] else 0xe67e22)
+            0xff0000
+            if suspicious
+            else (
+                0xf1c40f
+                if origin["unresolved_proxy"] or not recognized
+                else (0x2ecc71 if origin["is_local"] else 0xe67e22)
+            )
         ),
     )
     embed.add_field(
@@ -1809,6 +2340,14 @@ async def _notify_remote_ssh_login(channel, event, timestamp):
         value=origin["label"],
         inline=True,
     )
+    embed.add_field(name="🔐 Clave", value=identity, inline=False)
+    anomalies = _anomaly_field(verdict)
+    if anomalies:
+        embed.add_field(
+            name="🚩 Anomalías" if suspicious else "ℹ️ Notas",
+            value=anomalies,
+            inline=False,
+        )
     if cloudflare_event:
         embed.add_field(
             name="☁️ Cloudflare Access",
@@ -1848,6 +2387,16 @@ async def _notify_remote_ssh_fail(channel, event, timestamp):
     )
     key = f"bruteforce:{ip}"
     now = datetime.now()
+    if (
+        SSH_FAIL_NOTIFY_ENABLED
+        and summary["ssh_fails"] < REMOTE_ARCH_SSH_FAIL_THRESHOLD
+        and _should_notify_fail(
+            ssh_fail_notified, f"{_remote_name()}:{ip}", now
+        )
+    ):
+        await channel.send(embed=_build_ssh_fail_embed(
+            event, summary, node=_remote_name()
+        ))
     if (
         summary["ssh_fails"] >= REMOTE_ARCH_SSH_FAIL_THRESHOLD
         and now - remote_last_alert_time.get(key, datetime.min) > ALERT_COOLDOWN
@@ -1971,24 +2520,30 @@ async def watch_remote_docker():
         name = container.get("name") or ""
         if not name:
             continue
+        # `name` sigue siendo la task: es con lo que hay que hablarle a Docker.
+        # `shown` es como se nombra al humano, y ademas es estable entre deploys,
+        # asi que sirve de clave de cooldown — con el task id, un redeploy
+        # reseteaba el silencio y la misma alarma volvia a sonar.
+        service = service_of(name)
+        shown = display_name(service, swarm=service != name)
         state = (container.get("state") or "").lower()
         if state == "restarting":
-            previous_heal = remote_docker_heal_attempts.get(name, datetime.min)
+            previous_heal = remote_docker_heal_attempts.get(service, datetime.min)
             if now - previous_heal > HEAL_TIMEOUT:
-                remote_docker_heal_attempts[name] = now
+                remote_docker_heal_attempts[service] = now
                 try:
                     await remote_arch.request("heal", name, timeout=70)
                     remote_stats_counter["docker_alerts"] += 1
                     await channel.send(embed=_remote_embed(
                         f"🩹 Auto-Healing — {_remote_name()}",
-                        description=f"`{name}` estaba reiniciando y fue reiniciado.",
+                        description=f"`{shown}` estaba reiniciando y fue reiniciado.",
                         color=0x3498db,
                     ))
                 except RemoteHostError as error:
                     await channel.send(embed=_remote_embed(
                         f"🔄 Docker Loop — {_remote_name()}",
                         description=(
-                            f"`{name}` sigue reiniciando y el intento de "
+                            f"`{shown}` sigue reiniciando y el intento de "
                             f"recuperación falló.\n`{str(error)[:500]}`"
                         ),
                         color=0xe67e22,
@@ -1996,7 +2551,13 @@ async def watch_remote_docker():
                 continue
         cpu = float(container.get("cpu", 0))
         ram = float(container.get("ram", 0))
-        alert_key = f"resource:{name}"
+        image = container.get("image") or "?"
+        # Un contenedor sin --name se llama distinto en cada corrida, asi que la
+        # clave por nombre no silenciaba nada: cada escaneo de Trivy que lanza
+        # Vuln-Sentinel volvia a alarmar con otro nombre al azar. Para esos la
+        # identidad estable es la imagen.
+        anonymous = is_anonymous(name)
+        alert_key = f"resource:{image if anonymous else service}"
         if (
             (cpu > 90 or ram > 90)
             and now - remote_last_docker_alert.get(
@@ -2004,7 +2565,7 @@ async def watch_remote_docker():
             ) > ALERT_COOLDOWN
         ):
             embed = _remote_embed(
-                f"🐳 Alto Consumo — {name} — {_remote_name()}",
+                f"🐳 Alto Consumo — {image if anonymous else shown} — {_remote_name()}",
                 color=0xe67e22,
             )
             if cpu > 90:
@@ -2015,6 +2576,19 @@ async def watch_remote_docker():
                     value=f"**{ram:.1f}%** ({container.get('mem_usage', '')})",
                     inline=True,
                 )
+            embed.add_field(name="Imagen", value=f"`{image}`", inline=False)
+            if anonymous:
+                # No se silencia: un contenedor anonimo comiendose la CPU es
+                # exactamente como se ve un minero. Se lo hace identificable.
+                embed.add_field(
+                    name="Contenedor efímero",
+                    value=(
+                        f"`{name}` — lanzado sin `--name`, Docker lo bautizó al "
+                        "azar y para cuando leas esto probablemente ya no exista. "
+                        "Se identifica por la imagen."
+                    ),
+                    inline=False,
+                )
             await channel.send(embed=embed)
             remote_last_docker_alert[alert_key] = now
             remote_stats_counter["docker_alerts"] += 1
@@ -2022,7 +2596,6 @@ async def watch_remote_docker():
 
 @tasks.loop(hours=24)
 async def watch_remote_backups():
-    global remote_backup_alerted
     channel = bot.get_channel(CHANNEL_ID)
     if not channel or remote_arch is None:
         return
@@ -2032,30 +2605,15 @@ async def watch_remote_backups():
         if DEBUG_MODE:
             print(f"Remote backup watcher: {error}", file=sys.stderr)
         return
-    timestamp = payload.get("last_timestamp")
-    stale = (
-        payload.get("configured")
-        and payload.get("exists")
-        and (
-            not timestamp
-            or datetime.now() - datetime.fromtimestamp(timestamp)
-            > timedelta(hours=25)
-        )
-    )
-    if stale and not remote_backup_alerted:
-        remote_backup_alerted = True
-        await channel.send(embed=_remote_embed(
-            f"🚨 Backup desactualizado — {_remote_name()}",
-            description=(
-                "El repositorio no tiene un índice reciente."
-                if not timestamp else
-                "Último índice: "
-                f"`{datetime.fromtimestamp(timestamp):%d/%m/%Y %H:%M}`."
-            ),
-            color=0xff0000,
+    status = backup_monitor.local_status_from_payload(payload, label=_remote_name())
+    assessment = status.assess(BACKUP_POLICY, datetime.now())
+    # Sin configurar no es una alarma: es un nodo que no participa del sistema.
+    if assessment.severity == backup_monitor.NO_DATA:
+        return
+    if remote_backup_alert.should_notify(assessment.severity):
+        await channel.send(embed=embed_from_view(
+            backup_monitor.render_local(status, BACKUP_POLICY)
         ))
-    elif not stale:
-        remote_backup_alerted = False
 
 
 @tasks.loop(minutes=1)
@@ -2357,25 +2915,128 @@ async def watch_docker_resources():
 
 @tasks.loop(hours=24)
 async def watch_backups():
+    """Repo Borg local. Solo habla cuando cambia el estado, no cada 24 h."""
     channel = bot.get_channel(CHANNEL_ID)
-    if not channel or not BACKUP_PATH or not os.path.exists(BACKUP_PATH):
+    if not channel or not BACKUP_PATH:
         return
-    # FIX: Borg no crea archivos nuevos, actualiza index.* — chequeamos su mtime
-    last_mtime, index_file = await asyncio.to_thread(get_borg_last_backup, BACKUP_PATH)
-    if last_mtime is None:
-        await channel.send(embed=discord.Embed(
-            title="🚨 Repo Borg sin índice",
-            description=f"No se encontró `index.*` en `{BACKUP_PATH}`.",
-            color=0xff0000
+    status = await asyncio.to_thread(
+        backup_monitor.inspect_local_repo, BACKUP_PATH, SERVER_NAME
+    )
+    assessment = status.assess(BACKUP_POLICY, datetime.now())
+    if assessment.severity == backup_monitor.NO_DATA:
+        return
+    if local_backup_alert.should_notify(assessment.severity):
+        await channel.send(embed=embed_from_view(
+            backup_monitor.render_local(status, BACKUP_POLICY)
         ))
+
+
+@tasks.loop(hours=1)
+async def watch_backup_fleet():
+    """Vigila el sistema de backups de la flota y avisa en las transiciones.
+
+    Corre seguido y habla poco: el reporte completo lo manda
+    `backup_fleet_report`, esto es la alarma. Un backup que se rompe a las
+    04:00 no puede esperar al reporte de las 12 h.
+    """
+    global backup_source_failed
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or not backup_fleet_configured():
         return
-    age = datetime.now() - last_mtime
-    if age > timedelta(hours=25):
-        embed = discord.Embed(title="🚨 Backup Desactualizado", color=0xff0000)
-        embed.add_field(name="Índice", value=f"`{os.path.basename(index_file)}`", inline=True)
-        embed.add_field(name="Antigüedad", value=str(age).split('.')[0], inline=True)
-        embed.add_field(name="Última modificación", value=last_mtime.strftime('%d/%m/%Y %H:%M'), inline=True)
-        await channel.send(embed=embed)
+    try:
+        report = await fetch_backup_report()
+    except backup_monitor.BackupMonitorError as error:
+        # Que no se pueda consultar el estado de los backups es, en sí, algo
+        # que hay que saber: se avisa una vez y no se repite hasta que vuelva.
+        if not backup_source_failed:
+            backup_source_failed = True
+            await channel.send(embed=discord.Embed(
+                title="⚪ No pude leer el estado de los backups",
+                description=str(error)[:1500],
+                color=backup_monitor.SEVERITY_COLOR[backup_monitor.NO_DATA],
+            ))
+        elif DEBUG_MODE:
+            print(f"Backup fleet watcher: {error}", file=sys.stderr)
+        return
+
+    backup_source_failed = False
+    if backup_alert_state.should_notify(report.severity):
+        await channel.send(embed=embed_from_view(
+            backup_monitor.render_fleet(report, run=await _backup_run_or_none()),
+            timestamp=report.generated_at,
+        ))
+
+
+@tasks.loop(minutes=BACKUP_RUN_WATCH_MIN)
+async def watch_backup_runs():
+    """Avisa cuando un backup arranca, cuando termina y cuando es el proximo.
+
+    Es lo mismo que hace el Updates-Bot con el update diario: un mensaje al
+    empezar que se va editando con el avance, y el resultado al final. Un
+    backup de la flota que dura dos horas y solo se anuncia al terminar es
+    indistinguible, mientras pasa, de uno que no arranco nunca.
+    """
+    global backup_run_message
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or not backup_fleet_configured() or not BACKUP_RUN_ANNOUNCE:
+        return
+    try:
+        run = await fetch_backup_run()
+    except backup_monitor.BackupMonitorError as error:
+        # Silencioso a proposito: quien avisa que no se puede leer el estado de
+        # los backups es watch_backup_fleet, y una vez sola. Este loop corre
+        # cada minuto; si tambien avisara serian 60 mensajes por hora.
+        if DEBUG_MODE:
+            print(f"Backup run watcher: {error}", file=sys.stderr)
+        return
+
+    for announcement in backup_run_announcer.observe(run):
+        embed = embed_from_view(announcement.view, timestamp=datetime.now())
+        if announcement.kind == 'started':
+            backup_run_message = await channel.send(embed=embed)
+        else:
+            await channel.send(embed=embed)
+            backup_run_message = None
+        save_backup_run_state(backup_run_announcer.dump())
+
+    # Avance: se edita el mensaje del arranque en vez de postear uno por host.
+    if run.running and backup_run_message is not None:
+        try:
+            await backup_run_message.edit(embed=embed_from_view(
+                backup_monitor.render_run_progress(run), timestamp=datetime.now()
+            ))
+        except discord.HTTPException as error:
+            # El mensaje pudo borrarse. No vale la pena romper el loop por eso.
+            if DEBUG_MODE:
+                print(f"No pude editar el aviso de backup: {error}", file=sys.stderr)
+            backup_run_message = None
+
+
+@tasks.loop(hours=max(1, BACKUP_REPORT_EVERY_H))
+async def backup_fleet_report():
+    """El reporte periódico: sale siempre, esté todo bien o mal.
+
+    Ver un ✅ cada tanto es la única forma de saber que el monitoreo sigue
+    vivo. Un canal que solo habla cuando algo se rompe es indistinguible de
+    un bot caído.
+    """
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel or not backup_fleet_configured() or not BACKUP_REPORT_ALWAYS:
+        return
+    # El deploy es un git-pull con restart: sin esta guarda, cada push manda un
+    # reporte de backups que nadie pidio.
+    if backup_fleet_report.current_loop == 0 and not BACKUP_REPORT_ON_START:
+        return
+    try:
+        report = await fetch_backup_report()
+    except backup_monitor.BackupMonitorError as error:
+        if DEBUG_MODE:
+            print(f"Backup fleet report: {error}", file=sys.stderr)
+        return
+    await channel.send(embed=embed_from_view(
+        backup_monitor.render_fleet(report, run=await _backup_run_or_none()),
+        timestamp=report.generated_at,
+    ))
 
 @tasks.loop(hours=6)
 async def guardian_report():
@@ -2505,6 +3166,14 @@ async def guardian_report():
 
     for k in stats_counter:
         stats_counter[k] = 0
+
+
+@guardian_report.before_loop
+async def wait_before_first_guardian_report():
+    """Avoid a cold Chromium render immediately after every bot deploy."""
+    await bot.wait_until_ready()
+    if GRAFANA_GUARDIAN_START_DELAY:
+        await asyncio.sleep(GRAFANA_GUARDIAN_START_DELAY)
 
 # ==========================================
 # COMANDOS
@@ -2682,6 +3351,55 @@ async def who_online(ctx, host: str = None):
             )
     await ctx.send(embed=embed)
 
+@bot.command(name='keys', aliases=['claves'])
+async def show_keys(ctx, host: str = None):
+    """Claves SSH que el nodo acepta, con el nombre que el bot les pone.
+
+    Existe para poder auditar el mapa sin entrar al servidor: si un login
+    aparece como "clave no reconocida", aca se ve si falta la clave en el
+    `authorized_keys` o si simplemente falta etiquetarla.
+    """
+    remote = _is_remote_alias(host)
+    directory = remote_key_directory if remote else local_key_directory
+    name = _remote_name() if remote else SERVER_NAME
+    if not directory.loaded:
+        return await ctx.send(
+            f"❌ El directorio de claves de **{name}** todavía no se cargó."
+        )
+    embed = discord.Embed(
+        title=f"🔐 Claves autorizadas — {name}",
+        description=(
+            f"{len(directory)} clave(s) · cuentas leídas: "
+            + (", ".join(f"`{user}`" for user in sorted(directory.covered_users))
+               or "_ninguna_")
+        ),
+        color=0x3498db,
+        timestamp=datetime.now(),
+    )
+    for fingerprint, entry in directory.items()[:20]:
+        label, _ = directory.describe(fingerprint)
+        users = ", ".join(sorted(directory.authorized_users(fingerprint))) or "?"
+        embed.add_field(
+            name=f"{label}",
+            value=(
+                f"`…{directory.short(fingerprint)}` · "
+                f"`{entry.get('key_type', '?')}`\ncuentas: `{users}`"
+            ),
+            inline=True,
+        )
+    if not len(directory):
+        embed.add_field(
+            name="Sin datos",
+            value=(
+                "No se pudo leer ningún `authorized_keys`. Revisá "
+                "`SSH_KEY_DIRECTORY_FILES` y los `BindReadOnlyPaths` del "
+                "drop-in de systemd."
+            ),
+            inline=False,
+        )
+    await ctx.send(embed=embed)
+
+
 @bot.command(name='temps')
 async def show_temps(ctx, host: str = None):
     if _is_remote_alias(host):
@@ -2833,7 +3551,7 @@ async def check_containers(ctx, host: str = None):
             value += f"\nCPU: `{st['cpu']:.1f}%` RAM: `{st['mem_pct']:.1f}%`"
         if s["stale"]:
             value += f"\n_{s['stale']} task(s) vieja(s) sin limpiar_"
-        embed.add_field(name=f"{icon} {s['service']}", value=value, inline=True)
+        embed.add_field(name=f"{icon} {s['display']}", value=value, inline=True)
     if len(services) > 15:
         embed.set_footer(text=f"...y {len(services) - 15} servicio(s) mas")
     await ctx.send(embed=embed)
@@ -2859,30 +3577,57 @@ async def check_os_updates(ctx, host: str = None):
     await msg.edit(content=None, embed=embed)
 
 @bot.command(name='backups')
-async def check_backups(ctx, host: str = None):
-    if _is_remote_alias(host):
+async def check_backups(ctx, target: str = None):
+    """Estado de los backups.
+
+    `!backups`          → la flota entera (o el repo local si no hay métricas)
+    `!backups next`     → cuándo es el próximo backup y cómo salió el último
+    `!backups local`    → el repo Borg de este host
+    `!backups arch`     → el nodo remoto, vía su agente
+    `!backups <host>`   → filtra el reporte de flota por host
+    """
+    if _is_remote_alias(target):
         return await _remote_backups_command(ctx)
-    if not BACKUP_PATH:
-        return await ctx.send("❌ `BACKUP_PATH` no configurado.")
-    if not os.path.exists(BACKUP_PATH):
-        return await ctx.send(f"❌ `{BACKUP_PATH}` no existe.")
-    # FIX: usar mtime del index.* de Borg en vez de buscar archivos nuevos
-    last_mtime, index_file = await asyncio.to_thread(get_borg_last_backup, BACKUP_PATH)
-    if last_mtime is None:
-        return await ctx.send(f"❌ No se encontró `index.*` en `{BACKUP_PATH}`.")
-    age = datetime.now() - last_mtime
-    repo_size = await asyncio.to_thread(
-        lambda: sum(os.path.getsize(os.path.join(r, f))
-                    for r, _, fs in os.walk(BACKUP_PATH) for f in fs)
-    )
-    is_ok = age < timedelta(hours=25)
-    embed = discord.Embed(title="💾 Backup Borg", color=0x2ecc71 if is_ok else 0xff0000)
-    embed.add_field(name="Índice", value=f"`{os.path.basename(index_file)}`", inline=False)
-    embed.add_field(name="Última ejecución", value=last_mtime.strftime('%d/%m/%Y %H:%M'), inline=True)
-    embed.add_field(name="Antigüedad", value=str(age).split('.')[0], inline=True)
-    embed.add_field(name="Tamaño repo", value=format_bytes(repo_size), inline=True)
-    embed.add_field(name="Estado", value="✅ Al día" if is_ok else "🔴 Desactualizado", inline=False)
-    await ctx.send(embed=embed)
+
+    if (target or "").strip().lower() in ("next", "proximo", "próximo", "run"):
+        if not backup_fleet_configured():
+            return await ctx.send(
+                "❌ No hay fuente de métricas configurada. Ver `BACKUP_PROMETHEUS_URL` "
+                "en el README."
+            )
+        try:
+            run = await fetch_backup_run()
+        except backup_monitor.BackupMonitorError as error:
+            return await ctx.send(f"❌ {str(error)[:1900]}")
+        if not run.present:
+            return await ctx.send(
+                "⚪ El orquestador de backups no está reportando. O todavía no se "
+                "desplegó, o su `.prom` no está llegando a Prometheus."
+            )
+        view = (
+            backup_monitor.render_run_progress(run)
+            if run.running
+            else backup_monitor.render_run_finished(run)
+        )
+        return await ctx.send(embed=embed_from_view(view, timestamp=datetime.now()))
+
+    wants_local = (target or "").strip().lower() in ("local", "host", "aca", "acá")
+    if wants_local or not backup_fleet_configured():
+        if not BACKUP_PATH:
+            return await ctx.send(
+                "❌ No hay `BACKUP_PATH` local ni fuente de métricas configurada. "
+                "Ver `BACKUP_PROMETHEUS_URL` en el README."
+            )
+        return await ctx.send(embed=embed_from_view(await local_backup_view()))
+
+    msg = await ctx.send("💾 **Consultando el estado de los backups...**")
+    try:
+        report = await fetch_backup_report()
+    except backup_monitor.BackupMonitorError as error:
+        return await msg.edit(content=f"❌ {str(error)[:1900]}")
+    run = await _backup_run_or_none()
+    view = backup_monitor.render_fleet(report, host_filter=target, run=run)
+    await msg.edit(content=None, embed=embed_from_view(view, timestamp=report.generated_at))
 
 # ==========================================
 # COMANDO GRAFANA (paneles del dashboard en el bot)
@@ -3185,6 +3930,47 @@ async def grafana_cmd(ctx, dashboard: str = None, panel: str = None, rng: str = 
         await ctx.send(f"❌ Grafana: {e}")
     except Exception as e:
         await ctx.send(f"❌ Error inesperado: `{e}`")
+
+
+# ==========================================
+# BLINDAJE DE LOS LOOPS
+# ==========================================
+# Va aca abajo, y no junto a on_ready, porque la lista nombra los loops: antes
+# de este punto del archivo todavia no estan definidos.
+#
+# Un tasks.loop que deja escapar una excepcion se detiene para siempre, y la
+# unica senal seria la ausencia de alertas. Ninguno arranca sin su manejador.
+MONITOR_LOOPS = [
+    backup_fleet_report,
+    collect_history,
+    guardian_report,
+    refresh_key_directories,
+    watch_backup_fleet,
+    watch_backup_runs,
+    watch_backups,
+    watch_cloudflare_access,
+    watch_docker_loops,
+    watch_docker_resources,
+    watch_fail2ban,
+    watch_network,
+    watch_remote_arch,
+    watch_remote_backups,
+    watch_remote_docker,
+    watch_remote_security,
+    watch_resources,
+    watch_services,
+    watch_speed,
+]
+
+
+async def _notify_loop_failure(text):
+    """Avisar al canal de siempre que un monitoreo se cayo o volvio."""
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel:
+        await channel.send(text)
+
+
+loop_guard = LoopGuard(notify=_notify_loop_failure)
 
 
 # --- START ---
