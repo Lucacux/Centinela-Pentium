@@ -1,6 +1,5 @@
 import asyncio
-
-import pytest
+import unittest
 
 import loop_guard
 from loop_guard import LoopGuard, arm, arm_all, is_transient, next_delay
@@ -101,241 +100,235 @@ def caida(guard, loop, name, exc=None):
     return asyncio.run(guard.handle(loop, name, exc or DiscordServerError()))
 
 
-# --------------------------------------------------------------------------
-# is_transient
-# --------------------------------------------------------------------------
-@pytest.mark.parametrize("exc", [
-    DiscordServerError("503 Service Unavailable"),
-    HTTPException(503),
-    HTTPException(500),
-    HTTPException(429),
-    asyncio.TimeoutError(),
-    ConnectionResetError(),
-    OSError("network unreachable"),
-])
-def test_errores_de_red_y_api_son_transitorios(exc):
-    assert is_transient(exc) is True
+class ClasificacionDeErroresTests(unittest.TestCase):
+    def test_errores_de_red_y_api_son_transitorios(self):
+        for exc in [
+            DiscordServerError(),
+            HTTPException(503),
+            HTTPException(500),
+            HTTPException(429),
+            asyncio.TimeoutError(),
+            ConnectionResetError(),
+            OSError("network unreachable"),
+        ]:
+            with self.subTest(exc=type(exc).__name__):
+                self.assertTrue(is_transient(exc))
+
+    def test_los_errores_nuestros_no_son_transitorios(self):
+        for exc in [
+            HTTPException(403),
+            HTTPException(404),
+            KeyError("falta la clave"),
+            ValueError("bug nuestro"),
+        ]:
+            with self.subTest(exc=repr(exc)):
+                self.assertFalse(is_transient(exc))
+
+    def test_una_subclase_se_reconoce_por_su_jerarquia(self):
+        """En discord.py DiscordServerError hereda de HTTPException.
+
+        Comparar el nombre concreto de la clase se le escapaba.
+        """
+        self.assertTrue(is_transient(DiscordServerError()))
+
+    def test_httpexception_sin_status_no_se_asume_transitoria(self):
+        exc = HTTPException(500)
+        del exc.status
+        self.assertFalse(is_transient(exc))
 
 
-@pytest.mark.parametrize("exc", [
-    HTTPException(403),
-    HTTPException(404),
-    KeyError("falta la clave"),
-    ValueError("bug nuestro"),
-])
-def test_los_errores_nuestros_no_son_transitorios(exc):
-    assert is_transient(exc) is False
+class BackoffTests(unittest.TestCase):
+    def test_el_backoff_crece_y_tiene_techo(self):
+        self.assertEqual(next_delay(1, base=30, maximum=900), 30)
+        self.assertEqual(next_delay(2, base=30, maximum=900), 60)
+        self.assertEqual(next_delay(3, base=30, maximum=900), 120)
+        self.assertEqual(next_delay(99, base=30, maximum=900), 900)
+
+    def test_el_backoff_tolera_un_contador_invalido(self):
+        self.assertEqual(next_delay(0, base=30, maximum=900), 30)
+
+    def test_los_defaults_del_modulo_son_los_documentados(self):
+        self.assertEqual(loop_guard.BASE_DELAY, 30.0)
+        self.assertEqual(loop_guard.MAX_DELAY, 900.0)
 
 
-def test_httpexception_sin_status_no_se_asume_transitoria():
-    exc = HTTPException(500)
-    del exc.status
-    assert is_transient(exc) is False
+class ElLoopVuelveTests(unittest.TestCase):
+    """Lo que de verdad importa: despues de un fallo, el monitoreo sigue vivo."""
 
+    def test_un_503_relanza_el_loop(self):
+        guard, clock, _, _ = build()
+        loop = FakeLoop("watch_remote_arch")
 
-# --------------------------------------------------------------------------
-# next_delay
-# --------------------------------------------------------------------------
-def test_el_backoff_crece_y_tiene_techo():
-    assert next_delay(1, base=30, maximum=900) == 30
-    assert next_delay(2, base=30, maximum=900) == 60
-    assert next_delay(3, base=30, maximum=900) == 120
-    assert next_delay(99, base=30, maximum=900) == 900
+        ok = asyncio.run(guard.handle(loop, "watch_remote_arch",
+                                      DiscordServerError()))
 
+        self.assertTrue(ok)
+        self.assertEqual(loop.starts, 1, "el loop tiene que volver a arrancar")
+        self.assertEqual(clock.slept, [30.0], "y esperar el backoff antes")
 
-def test_el_backoff_tolera_un_contador_invalido():
-    assert next_delay(0, base=30, maximum=900) == 30
+    def test_un_error_no_transitorio_tambien_relanza(self):
+        """Un bug nuestro no puede dejar el monitoreo mudo hasta el deploy."""
+        guard, _, _, _ = build()
+        loop = FakeLoop("watch_network")
 
+        ok = asyncio.run(guard.handle(loop, "watch_network", ValueError("bug")))
 
-# --------------------------------------------------------------------------
-# El comportamiento que importa: el loop vuelve
-# --------------------------------------------------------------------------
-def test_un_503_relanza_el_loop():
-    guard, clock, _, _ = build()
-    loop = FakeLoop("watch_remote_arch")
+        self.assertTrue(ok)
+        self.assertEqual(loop.starts, 1)
 
-    ok = asyncio.run(guard.handle(loop, "watch_remote_arch",
-                                  DiscordServerError("503")))
+    def test_los_fallos_seguidos_espacian_el_reintento(self):
+        guard, clock, _, _ = build()
+        loop = FakeLoop("watch_services")
 
-    assert ok is True
-    assert loop.starts == 1, "el loop tiene que volver a arrancar"
-    assert clock.slept == [30.0], "y esperar el backoff antes de hacerlo"
+        for _ in range(4):
+            caida(guard, loop, "watch_services")
 
+        self.assertEqual(clock.slept, [30.0, 60.0, 120.0, 240.0])
+        self.assertEqual(loop.starts, 4)
 
-def test_un_error_no_transitorio_tambien_relanza():
-    """Un bug nuestro no puede dejar el monitoreo mudo hasta el proximo deploy."""
-    guard, _, _, _ = build()
-    loop = FakeLoop("watch_network")
+    def test_el_backoff_respeta_el_techo(self):
+        guard, clock, _, _ = build(base_delay=30.0, max_delay=100.0)
+        loop = FakeLoop()
 
-    ok = asyncio.run(guard.handle(loop, "watch_network", ValueError("bug")))
+        for _ in range(5):
+            caida(guard, loop, "x")
 
-    assert ok is True
-    assert loop.starts == 1
+        self.assertEqual(clock.slept, [30.0, 60.0, 100.0, 100.0, 100.0])
 
+    def test_una_racha_vieja_no_arrastra_el_backoff(self):
+        """Un fallo por semana no puede terminar esperando 15 minutos."""
+        guard, clock, _, _ = build(reset_after=1800.0)
+        loop = FakeLoop()
 
-def test_los_fallos_seguidos_espacian_el_reintento():
-    guard, clock, _, _ = build()
-    loop = FakeLoop("watch_services")
-
-    for _ in range(4):
-        caida(guard, loop, "watch_services")
-
-    assert clock.slept == [30.0, 60.0, 120.0, 240.0]
-    assert loop.starts == 4
-
-
-def test_el_backoff_respeta_el_techo():
-    guard, clock, _, _ = build(base_delay=30.0, max_delay=100.0)
-    loop = FakeLoop()
-
-    for _ in range(5):
+        caida(guard, loop, "x")
+        clock.now += 5000  # pasa mucho tiempo sano
         caida(guard, loop, "x")
 
-    assert clock.slept == [30.0, 60.0, 100.0, 100.0, 100.0]
+        self.assertEqual(clock.slept, [30.0, 30.0],
+                         "el segundo fallo arranca de cero")
+
+    def test_cada_loop_lleva_su_propia_racha(self):
+        guard, clock, _, _ = build()
+        a, b = FakeLoop("a"), FakeLoop("b")
+
+        caida(guard, a, "a")
+        caida(guard, a, "a")
+        caida(guard, b, "b")
+
+        self.assertEqual(clock.slept, [30.0, 60.0, 30.0])
 
 
-def test_una_racha_vieja_no_arrastra_el_backoff():
-    """Un fallo por semana no puede terminar esperando 15 minutos."""
-    guard, clock, _, _ = build(reset_after=1800.0)
-    loop = FakeLoop()
+class AvisosTests(unittest.TestCase):
+    def test_avisa_la_caida_y_la_vuelta_una_sola_vez_por_racha(self):
+        guard, _, _, sent = build()
+        loop = FakeLoop("watch_remote_arch")
 
-    caida(guard, loop, "x")
-    clock.now += 5000  # pasa mucho tiempo sano
-    caida(guard, loop, "x")
+        caida(guard, loop, "watch_remote_arch")
+        caida(guard, loop, "watch_remote_arch")
 
-    assert clock.slept == [30.0, 30.0], "el segundo fallo arranca de cero"
+        self.assertEqual(len(sent), 2,
+                         "solo el primer fallo de la racha avisa (caida+vuelta)")
+        self.assertIn("se cayo", sent[0])
+        self.assertIn("watch_remote_arch", sent[0])
+        self.assertIn("volvio a arrancar", sent[1])
 
+    def test_si_discord_esta_caido_el_aviso_falla_pero_el_loop_vuelve(self):
+        """El aviso viaja por el mismo Discord que se cayo: no puede ser fatal."""
+        async def notify_roto(text):
+            raise DiscordServerError()
 
-def test_cada_loop_lleva_su_propia_racha():
-    guard, clock, _, _ = build()
-    a, b = FakeLoop("a"), FakeLoop("b")
+        guard, _, logs, _ = build(notify=notify_roto)
+        loop = FakeLoop("watch_backups")
 
-    caida(guard, a, "a")
-    caida(guard, a, "a")
-    caida(guard, b, "b")
+        ok = asyncio.run(guard.handle(loop, "watch_backups",
+                                      DiscordServerError()))
 
-    assert clock.slept == [30.0, 60.0, 30.0]
+        self.assertTrue(ok)
+        self.assertEqual(loop.starts, 1)
+        self.assertTrue(any("no se pudo avisar" in line for line in logs))
 
+    def test_sin_notify_configurado_igual_relanza(self):
+        guard, _, _, _ = build(notify=None)
+        loop = FakeLoop()
 
-# --------------------------------------------------------------------------
-# Avisos
-# --------------------------------------------------------------------------
-def test_avisa_la_caida_y_la_vuelta_una_sola_vez_por_racha():
-    guard, _, _, sent = build()
-    loop = FakeLoop("watch_remote_arch")
-
-    caida(guard, loop, "watch_remote_arch")
-    caida(guard, loop, "watch_remote_arch")
-
-    assert len(sent) == 2, "solo el primer fallo de la racha avisa (caida+vuelta)"
-    assert "se cayo" in sent[0] and "watch_remote_arch" in sent[0]
-    assert "volvio a arrancar" in sent[1]
-
-
-def test_si_discord_esta_caido_el_aviso_falla_pero_el_loop_vuelve():
-    """El aviso viaja por el mismo Discord que se cayo: no puede ser fatal."""
-    async def notify_roto(text):
-        raise DiscordServerError("503 otra vez")
-
-    guard, _, logs, _ = build(notify=notify_roto)
-    loop = FakeLoop("watch_backups")
-
-    ok = asyncio.run(guard.handle(loop, "watch_backups", DiscordServerError()))
-
-    assert ok is True
-    assert loop.starts == 1
-    assert any("no se pudo avisar" in line for line in logs)
+        self.assertTrue(asyncio.run(guard.handle(loop, "x",
+                                                 DiscordServerError())))
+        self.assertEqual(loop.starts, 1)
 
 
-def test_sin_notify_configurado_igual_relanza():
-    guard, _, _, _ = build(notify=None)
-    loop = FakeLoop()
-    assert asyncio.run(guard.handle(loop, "x", DiscordServerError())) is True
-    assert loop.starts == 1
+class RelanzamientoTests(unittest.TestCase):
+    def test_no_duplica_el_loop_si_sigue_figurando_activo(self):
+        """start() sobre un loop vivo lanza RuntimeError y duplica el trabajo."""
+        guard, _, logs, _ = build()
+        loop = FakeLoop(running=True)
+
+        ok = asyncio.run(guard.handle(loop, "x", DiscordServerError()))
+
+        self.assertFalse(ok)
+        self.assertEqual(loop.starts, 0)
+        self.assertTrue(any("no lo relanzo" in line for line in logs))
+
+    def test_espera_a_que_la_tarea_vieja_termine_de_bajar(self):
+        guard, _, _, _ = build()
+        loop = FakeLoop(stops_after=3)  # tarda 3 consultas en darse por detenido
+
+        ok = asyncio.run(guard.handle(loop, "x", DiscordServerError()))
+
+        self.assertTrue(ok)
+        self.assertEqual(loop.starts, 1)
+
+    def test_un_start_que_falla_no_tumba_al_guardia(self):
+        guard, _, logs, _ = build()
+        loop = FakeLoop(start_error=RuntimeError("Task is already launched"))
+
+        ok = asyncio.run(guard.handle(loop, "x", DiscordServerError()))
+
+        self.assertFalse(ok)
+        self.assertTrue(any("no se pudo relanzar" in line for line in logs))
 
 
-# --------------------------------------------------------------------------
-# Casos borde del relanzamiento
-# --------------------------------------------------------------------------
-def test_no_duplica_el_loop_si_sigue_figurando_activo():
-    """start() sobre un loop vivo lanzaria RuntimeError y duplicaria el trabajo."""
-    guard, _, logs, _ = build()
-    loop = FakeLoop(running=True)
+class CableadoTests(unittest.TestCase):
+    def test_arm_registra_el_handler_con_el_nombre_de_la_corrutina(self):
+        guard, _, _, _ = build()
+        loop = FakeLoop("watch_fail2ban")
 
-    ok = asyncio.run(guard.handle(loop, "x", DiscordServerError()))
+        name = arm(loop, guard)
 
-    assert ok is False
-    assert loop.starts == 0
-    assert any("no lo relanzo" in line for line in logs)
+        self.assertEqual(name, "watch_fail2ban")
+        self.assertIsNotNone(loop.handler)
 
+    def test_el_handler_armado_relanza_el_loop(self):
+        guard, _, _, _ = build()
+        loop = FakeLoop("watch_docker_loops")
+        arm(loop, guard)
 
-def test_espera_a_que_la_tarea_vieja_termine_de_bajar():
-    guard, _, _, _ = build()
-    loop = FakeLoop(stops_after=3)  # tarda 3 consultas en darse por detenido
+        asyncio.run(loop.handler(DiscordServerError()))
 
-    ok = asyncio.run(guard.handle(loop, "x", DiscordServerError()))
+        self.assertEqual(loop.starts, 1)
 
-    assert ok is True
-    assert loop.starts == 1
+    def test_arm_all_arma_todos(self):
+        guard, _, _, _ = build()
+        loops = [FakeLoop("a"), FakeLoop("b"), FakeLoop("c")]
 
+        names = arm_all(loops, guard)
 
-def test_un_start_que_falla_no_tumba_al_guardia():
-    guard, _, logs, _ = build()
-    loop = FakeLoop(start_error=RuntimeError("Task is already launched"))
+        self.assertEqual(names, ["a", "b", "c"])
+        self.assertTrue(all(loop.handler is not None for loop in loops))
 
-    ok = asyncio.run(guard.handle(loop, "x", DiscordServerError()))
+    def test_rearmar_es_idempotente(self):
+        """on_ready se repite en cada reconexion."""
+        guard, _, _, _ = build()
+        loop = FakeLoop("a")
 
-    assert ok is False
-    assert any("no se pudo relanzar" in line for line in logs)
+        arm(loop, guard)
+        primero = loop.handler
+        arm(loop, guard)
 
-
-# --------------------------------------------------------------------------
-# Cableado
-# --------------------------------------------------------------------------
-def test_arm_registra_el_handler_con_el_nombre_de_la_corrutina():
-    guard, _, _, _ = build()
-    loop = FakeLoop("watch_fail2ban")
-
-    name = arm(loop, guard)
-
-    assert name == "watch_fail2ban"
-    assert loop.handler is not None
+        self.assertIsNot(loop.handler, primero,
+                         "el handler nuevo pisa al anterior")
+        asyncio.run(loop.handler(DiscordServerError()))
+        self.assertEqual(loop.starts, 1, "y no se acumulan reinicios")
 
 
-def test_el_handler_armado_relanza_el_loop():
-    guard, _, _, _ = build()
-    loop = FakeLoop("watch_docker_loops")
-    arm(loop, guard)
-
-    asyncio.run(loop.handler(DiscordServerError("503")))
-
-    assert loop.starts == 1
-
-
-def test_arm_all_arma_todos():
-    guard, _, _, _ = build()
-    loops = [FakeLoop("a"), FakeLoop("b"), FakeLoop("c")]
-
-    names = arm_all(loops, guard)
-
-    assert names == ["a", "b", "c"]
-    assert all(loop.handler is not None for loop in loops)
-
-
-def test_rearmar_es_idempotente():
-    """on_ready se repite en cada reconexion."""
-    guard, _, _, _ = build()
-    loop = FakeLoop("a")
-
-    arm(loop, guard)
-    primero = loop.handler
-    arm(loop, guard)
-
-    assert loop.handler is not primero, "el handler nuevo pisa al anterior"
-    asyncio.run(loop.handler(DiscordServerError()))
-    assert loop.starts == 1, "y no se acumulan reinicios"
-
-
-def test_los_defaults_del_modulo_son_los_documentados():
-    assert loop_guard.BASE_DELAY == 30.0
-    assert loop_guard.MAX_DELAY == 900.0
+if __name__ == "__main__":
+    unittest.main()
