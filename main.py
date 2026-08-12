@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
 import netdiag
+from loop_guard import LoopGuard, arm_all
 import procmon
 import alerts
 import backup_monitor
@@ -2077,9 +2078,15 @@ async def _remote_backups_command(ctx):
 # ==========================================
 # EVENTOS Y TAREAS
 # ==========================================
+# MONITOR_LOOPS y el guardia se definen al final del archivo, despues del
+# ultimo @tasks.loop: la lista nombra los loops y aca arriba todavia no
+# existen. on_ready los usa recien cuando lo llaman, asi que le alcanza.
 @bot.event
 async def on_ready():
     print(f"Bot Centinela ONLINE: {bot.user}")
+    # Antes de cualquier start(). Rearmar es idempotente --error() pisa el
+    # manejador anterior-- y on_ready se repite en cada reconexion.
+    arm_all(MONITOR_LOOPS, loop_guard)
     for task in [collect_history, watch_resources, watch_docker_loops, watch_docker_resources, guardian_report, watch_network, watch_speed]:
         if not task.is_running():
             task.start()
@@ -3923,6 +3930,47 @@ async def grafana_cmd(ctx, dashboard: str = None, panel: str = None, rng: str = 
         await ctx.send(f"❌ Grafana: {e}")
     except Exception as e:
         await ctx.send(f"❌ Error inesperado: `{e}`")
+
+
+# ==========================================
+# BLINDAJE DE LOS LOOPS
+# ==========================================
+# Va aca abajo, y no junto a on_ready, porque la lista nombra los loops: antes
+# de este punto del archivo todavia no estan definidos.
+#
+# Un tasks.loop que deja escapar una excepcion se detiene para siempre, y la
+# unica senal seria la ausencia de alertas. Ninguno arranca sin su manejador.
+MONITOR_LOOPS = [
+    backup_fleet_report,
+    collect_history,
+    guardian_report,
+    refresh_key_directories,
+    watch_backup_fleet,
+    watch_backup_runs,
+    watch_backups,
+    watch_cloudflare_access,
+    watch_docker_loops,
+    watch_docker_resources,
+    watch_fail2ban,
+    watch_network,
+    watch_remote_arch,
+    watch_remote_backups,
+    watch_remote_docker,
+    watch_remote_security,
+    watch_resources,
+    watch_services,
+    watch_speed,
+]
+
+
+async def _notify_loop_failure(text):
+    """Avisar al canal de siempre que un monitoreo se cayo o volvio."""
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel:
+        await channel.send(text)
+
+
+loop_guard = LoopGuard(notify=_notify_loop_failure)
 
 
 # --- START ---
