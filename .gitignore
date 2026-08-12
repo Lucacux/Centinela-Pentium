@@ -5,6 +5,7 @@
 
 # Entorno Python
 venv/
+.venv/
 __pycache__/
 *.pyc
 
@@ -18,3 +19,6 @@ __pycache__/
 
 # Linea base del speedtest (datos locales del host)
 speedtest_history.json
+
+# Linea base de logins SSH: perfiles del host, no del repo
+ssh-baseline.json

@@ -25,7 +25,10 @@ import aiohttp
 # Imagen de error que Grafana devuelve cuando el plugin de render no esta
 # instalado ("No image renderer available/installed"). Tiene tamano fijo.
 _RENDERER_MISSING_SIZE = (478, 208)
-_RENDER_RETRY_DELAYS = (0, 2, 6)
+# A failed render can occupy Chromium until Grafana's own 60-second deadline.
+# One delayed retry is enough to recover a cold cache without starting three
+# resource-heavy browser processes back-to-back on the monitoring VM.
+_RENDER_RETRY_DELAYS = (0, 10)
 _RETRYABLE_RENDER_STATUS = {429, 500, 502, 503, 504}
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -66,7 +69,7 @@ def png_size(data):
 class GrafanaClient:
     """Cliente async minimalista para descubrir y renderizar paneles."""
 
-    def __init__(self, base_url, token, timeout=45):
+    def __init__(self, base_url, token, timeout=70):
         self.base = base_url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {token}"}
         self._timeout = aiohttp.ClientTimeout(total=timeout)

@@ -2,13 +2,22 @@ import unittest
 from unittest.mock import patch
 
 import docker_ops
-from docker_ops import group_services, resolve_service, restart_service, service_of
+from docker_ops import (
+    display_name,
+    group_services,
+    is_anonymous,
+    resolve_service,
+    restart_service,
+    service_of,
+)
 
 
 def task(name, status="Up 7 minutes", image="img:latest", ports=""):
+    service = service_of(name)
     return {
         "name": name,
-        "service": service_of(name),
+        "service": service,
+        "display": display_name(service, swarm=service != name),
         "status": status,
         "image": image,
         "ports": ports,
@@ -35,6 +44,72 @@ class ServiceNameTests(unittest.TestCase):
         a = service_of("api.1.aaaaaaaaaaaaaaaaaaaa")
         b = service_of("api.1.bbbbbbbbbbbbbbbbbbbb")
         self.assertEqual(a, b)
+
+
+class DisplayNameTests(unittest.TestCase):
+    """Los nombres que se ven en !ct. Todos los casos salen de hosts reales."""
+
+    def test_strips_dokploy_prefix_and_hash(self):
+        # server-mbp: cuatro apps de Dokploy indistinguibles en el celular.
+        self.assertEqual(
+            display_name("app-connect-haptic-interface-c4wev6"),
+            "connect-haptic-interface",
+        )
+        self.assertEqual(
+            display_name("app-parse-solid-state-bus-x4h5mo"),
+            "parse-solid-state-bus",
+        )
+
+    def test_strips_hash_without_the_app_prefix(self):
+        # pentium: mismo hash de Dokploy, sin "app-" adelante.
+        self.assertEqual(
+            display_name("discordbots-mediabot-glzzul"), "discordbots-mediabot"
+        )
+
+    def test_keeps_infra_names_that_are_not_hashes(self):
+        self.assertEqual(display_name("dokploy-postgres"), "dokploy-postgres")
+        self.assertEqual(display_name("dokploy-redis"), "dokploy-redis")
+        self.assertEqual(display_name("dokploy"), "dokploy")
+
+    def test_does_not_eat_a_real_word_of_six_letters(self):
+        # "server" mide lo mismo que un hash. Si se recorta, el nombre miente.
+        self.assertEqual(
+            display_name("vuln-sentinel-trivy-server"), "vuln-sentinel-trivy-server"
+        )
+        self.assertEqual(display_name("celery-worker"), "celery-worker")
+
+    def test_plain_containers_are_never_touched(self):
+        # Sin task de Swarm no hay sufijo generado: el nombre lo eligio alguien.
+        self.assertEqual(
+            display_name("app-testing-abc123", swarm=False), "app-testing-abc123"
+        )
+
+    def test_survives_a_redeploy(self):
+        first = task("app-parse-solid-state-bus-x4h5mo.1.mspes4bzsmh4zn3bju5k4o6by")
+        second = task("app-parse-solid-state-bus-x4h5mo.1.pigmb85ormpxkiuzmz1cdltru")
+        self.assertEqual(first["display"], second["display"])
+
+
+class IsAnonymousTests(unittest.TestCase):
+    def test_detects_the_names_docker_invents(self):
+        # Los dos son reales: alarmaron en server-mbp con 100% de CPU y para
+        # cuando se miraba el contenedor ya no existia. Eran escaneos de Trivy.
+        self.assertTrue(is_anonymous("affectionate_montalcini"))
+        self.assertTrue(is_anonymous("competent_shaw"))
+
+    def test_leaves_names_a_person_chose(self):
+        for name in (
+            "truly-postgres",
+            "borgmatic_truly_db",
+            "vuln-sentinel-trivy-server",
+            "watchtower",
+            "dokploy-redis",
+        ):
+            self.assertFalse(is_anonymous(name), name)
+
+    def test_empty_name_is_not_anonymous(self):
+        self.assertFalse(is_anonymous(""))
+        self.assertFalse(is_anonymous(None))
 
 
 class GroupServicesTests(unittest.TestCase):
@@ -94,6 +169,12 @@ class ResolveServiceTests(unittest.TestCase):
 
     def test_matches_by_substring_so_you_can_type_it_on_a_phone(self):
         svc, _ = self._resolve("mediabot")
+        self.assertEqual(svc["service"], "discordbots-mediabot-glzzul")
+
+    def test_accepts_the_short_name_that_ct_shows(self):
+        # Si !ct dice "discordbots-mediabot", tipear eso tiene que funcionar:
+        # el hash que se recorto para mostrarlo no se le puede pedir de vuelta.
+        svc, _ = self._resolve("discordbots-mediabot")
         self.assertEqual(svc["service"], "discordbots-mediabot-glzzul")
 
     def test_still_accepts_the_full_task_name(self):

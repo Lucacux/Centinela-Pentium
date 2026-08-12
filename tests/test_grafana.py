@@ -63,7 +63,12 @@ class RenderRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(png_size(result), (1600, 1600))
         self.assertEqual(session.requests, 2)
-        sleep.assert_awaited_once_with(2)
+        sleep.assert_awaited_once_with(10)
+
+    def test_default_timeout_covers_grafana_render_deadline(self):
+        client = GrafanaClient("http://grafana.invalid", "token")
+
+        self.assertEqual(client._timeout.total, 70)
 
     async def test_does_not_retry_non_transient_http_error(self):
         session = FakeSession([FakeResponse(401)])
