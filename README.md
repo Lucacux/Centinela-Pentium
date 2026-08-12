@@ -175,10 +175,12 @@ Three loops, on purpose:
 
 The "started" message is **edited** as hosts complete instead of posting one
 message per host. What has already been announced is persisted to
-`BACKUP_RUN_STATE_PATH`, because this bot runs on the very node the backup
-powers on at 03:00 and powers off when it finishes: between "started" and
-"finished" the process dies. In memory only, the completion notice would either
-never arrive or arrive again on every restart.
+`BACKUP_RUN_STATE_PATH`, because this bot runs on a node that is not 24/7: if
+the process dies between "started" and "finished", in memory only the completion
+notice would either never arrive or arrive again on every restart. (The backup
+window moved from 03:00 to 08:00, so pentium is now inside its own uptime window
+when a run happens and the backup no longer powers it off — less frequent, not
+impossible: a deploy restarts the bot, and the WOL schedule is editable.)
 
 With no metrics source configured the command falls back to `BACKUP_PATH`
 exactly as before — the feature is additive.
