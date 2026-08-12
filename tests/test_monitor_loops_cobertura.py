@@ -74,6 +74,33 @@ def test_la_lista_no_nombra_loops_que_no_existen():
     )
 
 
+def test_la_lista_se_define_despues_de_los_loops_que_nombra():
+    """MONITOR_LOOPS se evalua al importar el modulo, no al llamar a on_ready.
+
+    Definirla antes de los `@tasks.loop` que nombra es un NameError al arrancar
+    el bot: el modulo ni siquiera importa. Los otros tests de este archivo no
+    lo ven porque leen main.py con ast en vez de importarlo.
+    """
+    ultimo_loop = 0
+    for nodo in ast.walk(_arbol()):
+        if isinstance(nodo, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            if any(_es_tasks_loop(d) for d in nodo.decorator_list):
+                ultimo_loop = max(ultimo_loop, nodo.lineno)
+
+    linea_lista = None
+    for nodo in ast.walk(_arbol()):
+        if isinstance(nodo, ast.Assign):
+            if any(t.id == "MONITOR_LOOPS"
+                   for t in nodo.targets if isinstance(t, ast.Name)):
+                linea_lista = nodo.lineno
+
+    assert linea_lista is not None
+    assert linea_lista > ultimo_loop, (
+        f"MONITOR_LOOPS se define en la linea {linea_lista}, antes del ultimo "
+        f"@tasks.loop (linea {ultimo_loop}): eso es un NameError al importar"
+    )
+
+
 def test_los_loops_se_arman_antes_de_arrancarlos():
     """arm_all tiene que correr antes del primer start() de on_ready.
 
