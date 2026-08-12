@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
 import netdiag
+from loop_guard import LoopGuard, arm_all
 import procmon
 import alerts
 import backup_monitor
@@ -2077,9 +2078,48 @@ async def _remote_backups_command(ctx):
 # ==========================================
 # EVENTOS Y TAREAS
 # ==========================================
+# Todos los loops de monitoreo. Un tasks.loop que deja escapar una excepcion se
+# detiene para siempre, y la unica senal seria la ausencia de alertas: ninguno
+# arranca sin su manejador de error.
+MONITOR_LOOPS = [
+    backup_fleet_report,
+    collect_history,
+    guardian_report,
+    refresh_key_directories,
+    watch_backup_fleet,
+    watch_backup_runs,
+    watch_backups,
+    watch_cloudflare_access,
+    watch_docker_loops,
+    watch_docker_resources,
+    watch_fail2ban,
+    watch_network,
+    watch_remote_arch,
+    watch_remote_backups,
+    watch_remote_docker,
+    watch_remote_security,
+    watch_resources,
+    watch_services,
+    watch_speed,
+]
+
+
+async def _notify_loop_failure(text):
+    """Avisar al canal de siempre que un monitoreo se cayo o volvio."""
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel:
+        await channel.send(text)
+
+
+loop_guard = LoopGuard(notify=_notify_loop_failure)
+
+
 @bot.event
 async def on_ready():
     print(f"Bot Centinela ONLINE: {bot.user}")
+    # Antes de cualquier start(). Rearmar es idempotente --error() pisa el
+    # manejador anterior-- y on_ready se repite en cada reconexion.
+    arm_all(MONITOR_LOOPS, loop_guard)
     for task in [collect_history, watch_resources, watch_docker_loops, watch_docker_resources, guardian_report, watch_network, watch_speed]:
         if not task.is_running():
             task.start()
